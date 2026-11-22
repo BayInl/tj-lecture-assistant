@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -106,5 +108,31 @@ func TestLocalModeHelpers(t *testing.T) {
 	}
 	if p := parsePortOrDefault("http://127.0.0.1", "8848"); p != "8848" {
 		t.Fatalf("unexpected fallback port: %s", p)
+	}
+}
+
+func TestLoginAndFetchToken(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/login", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "tj_session", Value: "demo-sess", Path: "/"})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/api/account", func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("tj_session")
+		if err != nil || c.Value != "demo-sess" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"username":"alice","api_token":"tok-alice-999"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cli := newAPIClient()
+	tok, err := cli.LoginAndFetchToken(ts.URL, "alice", "secret123")
+	if err != nil || tok != "tok-alice-999" {
+		t.Fatalf("expected token tok-alice-999, got tok=%q err=%v", tok, err)
 	}
 }

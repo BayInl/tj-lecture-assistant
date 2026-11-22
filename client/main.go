@@ -47,6 +47,9 @@ type lectureApp struct {
 	draftOCRList   string
 	draftURL       string
 	draftToken     string
+	draftLoginUser string
+	draftLoginPass string
+	loginBusy      bool
 	draftProj      string
 	draftAutoCU    bool
 	draftLogin     bool
@@ -823,8 +826,41 @@ func (a *lectureApp) settingsTab(c *ui.Context) {
 			ui.Text(c, "服务器地址").FontSize(11).TextColor(t.TextMuted)
 			ui.TextInput(c.Key("cfg-url"), &a.draftURL).Placeholder("http://服务器IP:8848")
 
-			ui.Text(c, "API Token (tj_config.json auth.api_token)").FontSize(11).TextColor(t.TextMuted)
+			ui.Text(c, "API Token（可在 WebUI 右上角「客户端Token」复制，或下方用账号密码自动获取）").FontSize(11).TextColor(t.TextMuted)
 			ui.TextInput(c.Key("cfg-tok"), &a.draftToken).Password().Placeholder("输入专属 api_token")
+
+			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+				ui.TextInput(c.Key("cfg-luser"), &a.draftLoginUser).Placeholder("账号").Grow(1)
+				ui.TextInput(c.Key("cfg-lpass"), &a.draftLoginPass).Password().Placeholder("密码").Grow(1)
+				if ui.Button(c, "登录获取 Token").Disabled(a.loginBusy).Clicked() {
+					url := strings.TrimRight(strings.TrimSpace(a.draftURL), "/")
+					usr := strings.TrimSpace(a.draftLoginUser)
+					pwd := a.draftLoginPass
+					a.loginBusy = true
+					a.settingsMsg = "正在登录服务器获取专属 Token…"
+					go func() {
+						tok, err := a.api.LoginAndFetchToken(url, usr, pwd)
+						a.applyUI(true, func() {
+							a.loginBusy = false
+							if err != nil {
+								a.settingsMsg = "❌ 获取 Token 失败: " + err.Error()
+								return
+							}
+							a.draftURL = url
+							a.draftToken = tok
+							a.draftLoginPass = ""
+							a.cfg.RunMode = "remote"
+							a.cfg.ServerURL = url
+							a.cfg.APIToken = tok
+							_ = saveConfig(a.cfg)
+							a.settingsMsg = "✅ 已为 " + usr + " 自动获取并保存 API Token"
+						})
+						if err == nil {
+							a.triggerPoll()
+						}
+					}()
+				}
+			})
 		}
 
 		ui.Text(c, "项目目录（可选，留空使用内置插件）").FontSize(11).TextColor(t.TextMuted)

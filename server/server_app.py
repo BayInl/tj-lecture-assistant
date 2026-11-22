@@ -22,6 +22,7 @@ import threading
 import collections
 import datetime as dt
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -1447,37 +1448,46 @@ def _sleep(sec):
     STOP.wait(max(1.0, float(sec)))
 
 
+def _keepalive_one(u):
+    u_ka = 300
+    try:
+        u_ka = int(u.load_cfg(readonly=True).get("keepalive_sec", 300) or 300)
+        u.watch_token_file()
+    except Exception as e:
+        u.log("[keepalive] watch_token_file 异常 %s" % e)
+    if STOP.is_set():
+        return u_ka
+    if u.client.cookie:
+        verdict, info = u.probe_cookie()
+        with u.lock:
+            u.state["cookie"]["last_check"] = nowstr()
+        if verdict == "alive":
+            u.record_alive()
+        elif verdict == "dead":
+            u.record_dead_candidate(info, source="keepalive")
+        else:
+            u.log("[keepalive] 心跳未知(网络/服务端抖动), 不计入失效")
+    else:
+        with u.lock:
+            u._dead["streak"] = 0
+            u.state["cookie"].update(valid=False, present=False)
+    u.refresh_cookie_state(reload_disk=False)
+    return u_ka
+
+
 def keepalive_loop():
     log("[keepalive] 启动 (多用户模式)")
     while not STOP.is_set():
         root_cfg = load_cfg(readonly=True)
         rts = _all_runtimes()
         min_ka = int(root_cfg.get("keepalive_sec", 300) or 300)
-        for u in rts:
-            if STOP.is_set():
-                break
-            try:
-                u_ka = int(u.load_cfg(readonly=True).get("keepalive_sec", 300) or 300)
-                if u_ka < min_ka:
-                    min_ka = u_ka
-                u.watch_token_file()
-            except Exception as e:
-                u.log("[keepalive] watch_token_file 异常 %s" % e)
-            if u.client.cookie:
-                verdict, info = u.probe_cookie()
-                with u.lock:
-                    u.state["cookie"]["last_check"] = nowstr()
-                if verdict == "alive":
-                    u.record_alive()
-                elif verdict == "dead":
-                    u.record_dead_candidate(info, source="keepalive")
-                else:
-                    u.log("[keepalive] 心跳未知(网络/服务端抖动), 不计入失效")
-            else:
-                with u.lock:
-                    u._dead["streak"] = 0
-                    u.state["cookie"].update(valid=False, present=False)
-            u.refresh_cookie_state(reload_disk=False)
+        if len(rts) <= 1:
+            for u in rts:
+                min_ka = min(min_ka, _keepalive_one(u))
+        else:
+            with ThreadPoolExecutor(max_workers=min(8, len(rts))) as ex:
+                for u_ka in ex.map(_keepalive_one, rts):
+                    min_ka = min(min_ka, u_ka)
         _sleep(max(30, min_ka))
     log("[keepalive] 已停止")
 
@@ -1564,11 +1574,20 @@ def engine_loop():
             _sleep(min_interval)
             continue
 
-        for u in rts:
-            try:
-                u.process_scan_rows(uniq, off, rnd)
-            except Exception as e:
-                u.log("[engine] 处理扫描结果异常: %s" % e)
+        if len(rts) <= 1:
+            for u in rts:
+                try:
+                    u.process_scan_rows(uniq, off, rnd)
+                except Exception as e:
+                    u.log("[engine] 处理扫描结果异常: %s" % e)
+        else:
+            def _proc_user(usr):
+                try:
+                    usr.process_scan_rows(uniq, off, rnd)
+                except Exception as e:
+                    usr.log("[engine] 处理扫描结果异常: %s" % e)
+            with ThreadPoolExecutor(max_workers=min(8, len(rts))) as ex:
+                list(ex.map(_proc_user, rts))
 
         _sleep(max(10, min_interval))
     with GLOBAL_LOCK:

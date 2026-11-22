@@ -231,7 +231,11 @@ func captureAndUploadCookie(ctx context.Context, cfg ClientConfig, api *apiClien
 			progress(note + "，等待截获 Cookie…")
 		}
 	} else {
-		progress(fmt.Sprintf("代理已切至 127.0.0.1:%d，请在电脑微信里打开/刷新「同济高等讲堂」…", cfg.ProxyPort))
+		if runtime.GOOS == "windows" {
+			progress(fmt.Sprintf("代理已切至 127.0.0.1:%d，请在电脑微信打开「同济高等讲堂」（无响应请重开微信）…", cfg.ProxyPort))
+		} else {
+			progress(fmt.Sprintf("代理已切至 127.0.0.1:%d，请在电脑微信里打开/刷新「同济高等讲堂」…", cfg.ProxyPort))
+		}
 	}
 
 	deadline := time.Now().Add(180 * time.Second)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"strings"
 	"time"
 )
@@ -180,4 +181,61 @@ func (c *apiClient) UploadCookie(cfg ClientConfig, tok TokenPayload) error {
 		return fmt.Errorf("服务器校验 Cookie 未通过")
 	}
 	return nil
+}
+
+// LoginAndFetchToken logs into the WebUI with username/password and retrieves that user's personal API token.
+func (c *apiClient) LoginAndFetchToken(serverURL, username, password string) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(serverURL), "/")
+	if base == "" {
+		return "", fmt.Errorf("请先填写服务器地址")
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return "", err
+	}
+	cli := &http.Client{
+		Timeout:   8 * time.Second,
+		Transport: c.http.Transport,
+		Jar:       jar,
+	}
+	payload, err := json.Marshal(map[string]string{
+		"username": strings.TrimSpace(username),
+		"password": password,
+	})
+	if err != nil {
+		return "", err
+	}
+	resp, err := cli.Post(base+"/api/login", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	rawLogin, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	var loginRes struct {
+		OK  bool   `json:"ok"`
+		Msg string `json:"msg"`
+	}
+	_ = json.Unmarshal(rawLogin, &loginRes)
+	if resp.StatusCode >= 400 || !loginRes.OK {
+		return "", fmt.Errorf("%s", nonEmpty(loginRes.Msg, fmt.Sprintf("登录失败(HTTP %d)", resp.StatusCode)))
+	}
+
+	accResp, err := cli.Get(base + "/api/account")
+	if err != nil {
+		return "", err
+	}
+	rawAcc, _ := io.ReadAll(io.LimitReader(accResp.Body, 1<<20))
+	_ = accResp.Body.Close()
+	var accRes struct {
+		OK       bool   `json:"ok"`
+		APIToken string `json:"api_token"`
+		Msg      string `json:"msg"`
+	}
+	if err := json.Unmarshal(rawAcc, &accRes); err != nil {
+		return "", fmt.Errorf("解析账号信息失败")
+	}
+	if accResp.StatusCode >= 400 || !accRes.OK || accRes.APIToken == "" {
+		return "", fmt.Errorf("%s", nonEmpty(accRes.Msg, "获取 API Token 失败"))
+	}
+	return accRes.APIToken, nil
 }
