@@ -1,0 +1,93 @@
+name: CI & Multi-Platform Release
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify Python & Go (Cross-Platform)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client/go.mod
+      - name: Check Python syntax
+        run: python3 -B -m py_compile server/server_app.py server/lecture_grabber.py server/notify.py cookie-mac-linux/capture_token.py cookie-mac-linux/token_sniffer.py client/resources/token_sniffer.py
+      - name: Run Go vet & tests (linux + windows/amd64 compile check)
+        working-directory: client
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+          GOOS=windows GOARCH=amd64 go test -c -o /dev/null ./...
+          go test -v ./...
+
+  build-windows:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    name: Build Windows x64 Portable Bundle
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client/go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python build dependencies
+        run: python -m pip install -r server/requirements.txt -r cookie-mac-linux/requirements.txt pyinstaller
+      - name: Build Windows portable bundle
+        shell: pwsh
+        run: ./scripts/build_windows_bundle.ps1 -Version "${{ github.ref_name }}"
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TJ-Lecture-Windows-x64
+          path: dist/TJ-Lecture-Windows-x64.zip
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/TJ-Lecture-Windows-x64.zip
+
+  build-macos:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    name: Build macOS arm64 App
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client/go.mod
+      - name: Build Swift ocr-helper & MyGo .app
+        working-directory: client
+        run: |
+          swiftc -O ocr_helper.swift -o resources/ocr-helper
+          go tool mygo build -platform darwin/arm64 -skip-dmg
+          mkdir -p ../dist
+          ditto -c -k --keepParent "build/darwin-arm64/同济抢讲座助手.app" "../dist/TJ-Lecture-macOS-arm64.zip"
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TJ-Lecture-macOS-arm64
+          path: dist/TJ-Lecture-macOS-arm64.zip
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/TJ-Lecture-macOS-arm64.zip

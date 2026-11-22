@@ -1,0 +1,40 @@
+# Python / Virtualenvs
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+
+# Sensitive credentials & local config (NEVER commit)
+token.json
+*.token.json
+tj_config.json
+.api_token
+
+# Runtime state & logs
+won.json
+picked.json
+ignored.json
+*.log
+*.pid
+*.tmp*
+*.bak
+.auto_regrab_state
+.auto_regrab.lock
+.auto_regrab_paused
+.last_event_key
+
+# Windows bundled binaries (large, keep local)
+cookie-windows/capture_token.exe
+cookie-windows/mitmdump/
+
+# MyGo client build outputs & compiled helpers
+client/build/
+client/.mygo/
+client/resources/ocr-helper
+server/launchagents-disabled/
+dist/
+
+# OS / Editor
+.DS_Store
+Thumbs.db

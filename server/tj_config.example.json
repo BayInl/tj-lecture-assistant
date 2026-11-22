@@ -1,0 +1,42 @@
+{
+  "_comment": "复制为 tj_config.json 后修改; 也可不复制, 首次启动自动生成默认配置, 再在 WebUI 里改",
+  "dingtalk": {
+    "webhook": "",
+    "secret": "",
+    "prefix": "【同济高等讲堂】",
+    "notify_events": ["success", "cookie_dead", "new_target", "grab_fail"]
+  },
+  "webui": {
+    "host": "0.0.0.0",
+    "port": 8848
+  },
+  "auth": {
+    "enabled": true,
+    "username": "",
+    "password_hash": "",
+    "session_secret": "",
+    "session_ttl_sec": 604800,
+    "session_version": 1,
+    "api_token": ""
+  },
+  "server": {
+    "_comment": "仅 push_cookie.py / srv_deploy.py 同步/部署到服务器时需要; 本机单跑可不填",
+    "host": "",
+    "user": "",
+    "ssh_port": 22,
+    "remote_dir": "~/tj_lecture",
+    "key_file": "~/.ssh/tj_lecture_ed25519"
+  },
+  "keepalive_sec": 300,
+  "grab": {
+    "xiao_watch": true,
+    "xiao_auto": false,
+    "xiao_campus": "",
+    "yuan_watch": true,
+    "yuan_auto": true,
+    "yuan_college_only": true,
+    "keywords": [],
+    "interval_sec": 30,
+    "force": false
+  }
+}

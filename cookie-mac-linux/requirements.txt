@@ -1,0 +1,6 @@
+# capture_token.py 跨平台抓 Cookie 依赖
+# 安装: pip install -r requirements.txt
+#   macOS/Linux 若提示 externally-managed-environment:
+#   python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+mitmproxy>=10.0
+requests>=2.28

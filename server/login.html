@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 同济高等讲堂控制台</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2130; --line:#2a3446; --fg:#e6edf3; --mut:#8b98a9; --ok:#3fb950; --bad:#f85149; --acc:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif; padding:16px; }
+  .box { width:100%; max-width:380px; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px 22px; box-shadow:0 12px 36px rgba(0,0,0,.35); }
+  h1 { margin:0 0 6px; font-size:18px; }
+  .sub { color:var(--mut); font-size:12.5px; margin-bottom:18px; }
+  .fld { margin:12px 0; }
+  label { display:block; color:var(--mut); font-size:12px; margin-bottom:5px; }
+  input { width:100%; background:#0d1220; color:var(--fg); border:1px solid var(--line); border-radius:7px; padding:9px 10px; font-size:14px; outline:none; }
+  input:focus { border-color:var(--acc); }
+  button { width:100%; margin-top:14px; background:#1f6feb; border:1px solid #1f6feb; color:#fff; padding:10px; border-radius:7px; font-size:14px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  .msg { margin-top:12px; font-size:13px; min-height:20px; color:var(--bad); word-break:break-word; }
+  .msg.ok { color:var(--ok); }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>🎓 同济高等讲堂控制台</h1>
+  <div class="sub">个人专属管理面板，请先验证登录</div>
+  <form id="login-form">
+    <div class="fld">
+      <label for="username">账号</label>
+      <input id="username" name="username" type="text" autocomplete="username" required autofocus>
+    </div>
+    <div class="fld">
+      <label for="password">密码</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+    </div>
+    <button id="btn-submit" type="submit">登录</button>
+    <div id="msg" class="msg"></div>
+  </form>
+</div>
+<script>
+const form = document.getElementById('login-form');
+const btn = document.getElementById('btn-submit');
+const msg = document.getElementById('msg');
+let lockTimer = null;
+
+function startCooldown(sec) {
+  if (lockTimer) clearInterval(lockTimer);
+  let left = Math.max(1, Math.ceil(sec));
+  btn.disabled = true;
+  const tick = () => {
+    msg.className = 'msg';
+    msg.textContent = '尝试过于频繁，请 ' + left + ' 秒后再试';
+    if (left <= 0) {
+      clearInterval(lockTimer);
+      lockTimer = null;
+      btn.disabled = false;
+      msg.textContent = '';
+    }
+    left -= 1;
+  };
+  tick();
+  lockTimer = setInterval(tick, 1000);
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (btn.disabled) return;
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  if (!username || !password) {
+    msg.textContent = '请输入账号和密码';
+    return;
+  }
+  btn.disabled = true;
+  msg.className = 'msg';
+  msg.textContent = '';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.ok) {
+      msg.className = 'msg ok';
+      msg.textContent = '登录成功，正在进入控制台…';
+      window.location.replace('/');
+      return;
+    }
+    if (r.status === 429 && d.retry_after) {
+      startCooldown(d.retry_after);
+      return;
+    }
+    msg.textContent = d.msg || '登录失败';
+  } catch (err) {
+    msg.textContent = '网络请求失败，请检查服务是否在线';
+  }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>

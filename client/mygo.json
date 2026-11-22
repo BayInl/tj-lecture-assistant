@@ -1,0 +1,13 @@
+{
+  "name": "同济抢讲座助手",
+  "slug": "tj-lecture-client",
+  "identifier": "com.tj.lecture.client",
+  "version": "1.0.0",
+  "out": "build",
+  "macos": {
+    "minimumSystemVersion": "12.0",
+    "infoPlist": {
+      "LSUIElement": true
+    }
+  }
+}
