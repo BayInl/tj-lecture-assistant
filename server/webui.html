@@ -58,10 +58,12 @@
 <body>
 <header>
   <h1>🎓 同济高等讲堂 · 抢讲座控制台</h1>
+  <span class="pill" id="u-pill">👤 -</span>
   <span class="pill"><i class="dot idle" id="d-engine"></i><span id="s-engine">引擎…</span></span>
   <span class="pill"><i class="dot off" id="d-cookie"></i><span id="s-cookie">Cookie…</span></span>
   <span class="pill muted" id="s-now"></span>
   <span style="flex:1"></span>
+  <button onclick="showAccountBox()">🔑 客户端Token</button>
   <button onclick="scanNow()">立即扫描</button>
   <button onclick="testNotify()">测试钉钉</button>
   <button onclick="reloadCookie()">重载Cookie</button>
@@ -165,6 +167,26 @@
     <div id="x-body" class="muted">点“刷新列表”扫描（未结束/可报名优先）。看中了点「抢」预选到清单(不会立即抢)：未到点的到点自动猛攻，已开放的自动监测捡漏(有名额就抢/满了等退订)，清单里随时可取消。已加入的会置灰，抢到的进「🏆 已选到的讲座」；若在官方微信端手动取消，该场会自动标记并在列表显示「续抢」，不点不会自动重抢。</div>
   </div>
 
+  <!-- 管理员多用户管理（仅管理员可见） -->
+  <div class="card wide" id="admin-card" style="display:none">
+    <h2>👥 多用户管理（管理员 · 同端口单服务隔离）
+      <span style="float:right;display:flex;gap:8px;align-items:center">
+        <button onclick="loadAdminUsers()">刷新用户列表</button>
+      </span>
+    </h2>
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="mu-allow-reg"> 允许凭邀请码自助注册</label>
+      <input type="text" id="mu-invite" placeholder="邀请码（留空则无需邀请码）" style="max-width:220px">
+      <button onclick="saveMuSettings()">保存注册设置</button>
+    </div>
+    <div class="row">
+      <input type="text" id="mu-new-user" placeholder="新同门账号(字母数字)" style="max-width:180px">
+      <input type="text" id="mu-new-pass" placeholder="初始密码(至少6位)" style="max-width:180px">
+      <button class="primary" onclick="adminCreateUser()">创建账号并生成Token</button>
+    </div>
+    <div id="admin-users-body" class="muted">加载中…</div>
+  </div>
+
   <!-- 日志 -->
   <div class="card wide">
     <h2>📜 实时日志 <label class="chk" style="float:right"><input type="checkbox" id="autoscroll" checked> 自动滚动</label></h2>
@@ -197,7 +219,12 @@ async function doLogout(){
 
 async function refreshStatus(){
   let st; try { st = await jget('/api/status'); } catch(e){ return; }
-  const ck=st.cookie||{}, en=st.engine||{}, cfg=st.cfg||{}, grab=cfg.grab||{};
+  const ck=st.cookie||{}, en=st.engine||{}, cfg=st.cfg||{}, grab=cfg.grab||{}, usr=st.user||{};
+  $('u-pill').textContent = '👤 ' + (usr.username||'-') + (usr.role==='admin'?' (管理员)':'');
+  if(usr.role==='admin' && $('admin-card').style.display==='none'){
+    $('admin-card').style.display='block';
+    loadAdminUsers();
+  }
   $('s-now').textContent = '服务器本机 '+ (st.now||'');
   // engine pill
   $('d-engine').className='dot '+(en.running?'on':'off');
@@ -365,6 +392,63 @@ async function wonRearm(idx){
   const r=await jpost('/api/won',{action:'rearm',did:x.did});
   toast(r.ok? '✅ 已续抢武装: '+(r.mode||'')+' · '+(r.msg||'') : ('续抢失败: '+(r.msg||'')));
   refreshStatus(); loadList();
+}
+
+async function showAccountBox(){
+  const r=await jget('/api/account');
+  if(!r.ok){ toast('获取账号信息失败'); return; }
+  const msg='当前账号: '+r.username+'\n\nWindows/Mac 桌面客户端专属 API Token:\n'+r.api_token+'\n\n点「确定」可复制 Token（如需重置请在管理员面板操作）';
+  if(confirm(msg) && navigator.clipboard){
+    try{ await navigator.clipboard.writeText(r.api_token); toast('✅ 已复制你的专属 API Token'); }catch(e){}
+  }
+}
+
+async function loadAdminUsers(){
+  const r=await jget('/api/admin/users');
+  if(!r.ok) return;
+  const mu=r.multi_user||{};
+  $('mu-allow-reg').checked=!!mu.allow_register;
+  $('mu-invite').value=mu.invite_code||'';
+  const rows=r.users||[];
+  $('admin-users-body').innerHTML='<table><thead><tr><th>账号</th><th>角色</th><th>状态</th><th>Cookie</th><th>学生</th><th>已抢/待抢</th><th>专属 API Token</th><th>操作</th></tr></thead><tbody>'
+    + rows.map(u=>{
+      const ckTxt=u.cookie_valid===true?'<span class="tag t-on">有效</span>':(u.cookie_valid===false?'<span class="tag t-off">失效</span>':'<span class="tag">无</span>');
+      const stTxt=u.disabled?'<span class="tag t-off">已禁用</span>':'<span class="tag t-on">启用</span>';
+      const ops=u.is_primary?'<span class="muted">主管理员</span>'
+        :('<button onclick="adminToggleUser(\''+htmlEsc(u.username)+'\')">'+(u.disabled?'启用':'禁用')+'</button> '
+          +'<button onclick="adminRotateToken(\''+htmlEsc(u.username)+'\')">重置Token</button> '
+          +'<button class="danger" onclick="adminDeleteUser(\''+htmlEsc(u.username)+'\')">删除</button>');
+      return '<tr><td><b>'+htmlEsc(u.username)+'</b></td><td>'+htmlEsc(u.role)+'</td><td>'+stTxt+'</td><td>'+ckTxt+'</td>'
+        +'<td class="muted">'+htmlEsc(u.student||'-')+'</td>'
+        +'<td>'+u.won_count+' / '+u.candidates_count+'</td>'
+        +'<td style="font-family:ui-monospace,monospace;font-size:11px">'+htmlEsc(u.api_token||'-')+'</td>'
+        +'<td>'+ops+'</td></tr>';
+    }).join('') + '</tbody></table>';
+}
+async function saveMuSettings(){
+  const r=await jpost('/api/admin/users',{action:'settings',allow_register:$('mu-allow-reg').checked,invite_code:$('mu-invite').value.trim()});
+  toast(r.ok?'✅ 已保存多用户注册设置':'保存失败');
+}
+async function adminCreateUser(){
+  const username=$('mu-new-user').value.trim(), password=$('mu-new-pass').value;
+  if(!username||!password){ toast('请填写账号和密码'); return; }
+  const r=await jpost('/api/admin/users',{action:'create',username,password});
+  if(r.ok){ toast('✅ 已创建账号 '+username); $('mu-new-user').value=''; $('mu-new-pass').value=''; loadAdminUsers(); }
+  else toast('❌ '+(r.msg||'创建失败'));
+}
+async function adminToggleUser(username){
+  const r=await jpost('/api/admin/users',{action:'toggle',username});
+  if(r.ok){ toast('已更新状态'); loadAdminUsers(); }
+}
+async function adminRotateToken(username){
+  if(!confirm('重置 '+username+' 的 API Token? 旧客户端需更新 Token。')) return;
+  const r=await jpost('/api/admin/users',{action:'rotate_token',username});
+  if(r.ok){ toast('✅ 已重置 Token'); loadAdminUsers(); }
+}
+async function adminDeleteUser(username){
+  if(!confirm('确认删除用户 '+username+'?')) return;
+  const r=await jpost('/api/admin/users',{action:'delete',username,purge_data:false});
+  if(r.ok){ toast('✅ 已删除'); loadAdminUsers(); }
 }
 
 setInterval(refreshStatus, 3000);

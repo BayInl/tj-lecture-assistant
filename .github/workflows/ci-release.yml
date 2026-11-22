@@ -23,8 +23,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: client/go.mod
-      - name: Check Python syntax
-        run: python3 -B -m py_compile server/server_app.py server/lecture_grabber.py server/notify.py cookie-mac-linux/capture_token.py cookie-mac-linux/token_sniffer.py client/resources/token_sniffer.py
+      - name: Check Python syntax & multi-user unit tests
+        run: |
+          python3 -m pip install -r server/requirements.txt
+          python3 -B -m py_compile server/server_app.py server/lecture_grabber.py server/notify.py cookie-mac-linux/capture_token.py cookie-mac-linux/token_sniffer.py client/resources/token_sniffer.py
+          python3 -B -m unittest discover -s server -p "test_*.py" -v
       - name: Run Go vet & tests (linux + windows/amd64 compile check)
         working-directory: client
         run: |

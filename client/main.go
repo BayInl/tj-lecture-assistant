@@ -168,6 +168,7 @@ func statusChangedForUI(prev ServerStatus, next ServerStatus) bool {
 		return true
 	}
 	if prev.Engine.Running != next.Engine.Running ||
+		prev.User != next.User ||
 		prev.Engine.Round != next.Engine.Round ||
 		prev.Engine.Scanned != next.Engine.Scanned ||
 		prev.Engine.Offset != next.Engine.Offset ||
@@ -599,7 +600,9 @@ func (a *lectureApp) overviewTab(c *ui.Context) {
 				ui.Text(c, "Cookie: "+ckTxt).FontSize(12).Bold().TextColor(ckCol)
 				ui.Text(c, "· "+stuTxt).FontSize(12).TextColor(t.TextMuted).Grow(1)
 			})
-			if a.status.Cookie.LastCheck != "" {
+			if a.status.User.Username != "" {
+				ui.Text(c, "账号: "+a.status.User.Username+" · 最后心跳: "+nonEmpty(a.status.Cookie.LastCheck, "-")).FontSize(11).TextColor(t.TextMuted)
+			} else if a.status.Cookie.LastCheck != "" {
 				ui.Text(c, "最后心跳: "+a.status.Cookie.LastCheck).FontSize(11).TextColor(t.TextMuted)
 			}
 		})

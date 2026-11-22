@@ -8,9 +8,13 @@
   :root { --bg:#0f1420; --card:#1a2130; --line:#2a3446; --fg:#e6edf3; --mut:#8b98a9; --ok:#3fb950; --bad:#f85149; --acc:#58a6ff; }
   * { box-sizing:border-box; }
   body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif; padding:16px; }
-  .box { width:100%; max-width:380px; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px 22px; box-shadow:0 12px 36px rgba(0,0,0,.35); }
+  .box { width:100%; max-width:390px; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px 22px; box-shadow:0 12px 36px rgba(0,0,0,.35); }
   h1 { margin:0 0 6px; font-size:18px; }
-  .sub { color:var(--mut); font-size:12.5px; margin-bottom:18px; }
+  .sub { color:var(--mut); font-size:12.5px; margin-bottom:16px; }
+  .tabs { display:none; gap:8px; margin-bottom:14px; }
+  .tabs.show { display:flex; }
+  .tab { flex:1; text-align:center; padding:7px; border-radius:7px; border:1px solid var(--line); cursor:pointer; color:var(--mut); background:#0d1220; font-size:13px; }
+  .tab.active { color:#fff; border-color:var(--acc); background:#182840; font-weight:600; }
   .fld { margin:12px 0; }
   label { display:block; color:var(--mut); font-size:12px; margin-bottom:5px; }
   input { width:100%; background:#0d1220; color:var(--fg); border:1px solid var(--line); border-radius:7px; padding:9px 10px; font-size:14px; outline:none; }
@@ -24,15 +28,23 @@
 <body>
 <div class="box">
   <h1>🎓 同济高等讲堂控制台</h1>
-  <div class="sub">个人专属管理面板，请先验证登录</div>
+  <div class="sub" id="sub-txt">多用户独立控制台，请验证登录</div>
+  <div class="tabs" id="auth-tabs">
+    <div class="tab active" id="tab-login" onclick="setMode('login')">登录账号</div>
+    <div class="tab" id="tab-reg" onclick="setMode('reg')">邀请码注册</div>
+  </div>
   <form id="login-form">
     <div class="fld">
-      <label for="username">账号</label>
+      <label for="username">账号（字母/数字/_/-）</label>
       <input id="username" name="username" type="text" autocomplete="username" required autofocus>
     </div>
     <div class="fld">
       <label for="password">密码</label>
       <input id="password" name="password" type="password" autocomplete="current-password" required>
+    </div>
+    <div class="fld" id="inv-wrap" style="display:none">
+      <label for="invite_code">邀请码</label>
+      <input id="invite_code" name="invite_code" type="text" placeholder="向管理员获取邀请码">
     </div>
     <button id="btn-submit" type="submit">登录</button>
     <div id="msg" class="msg"></div>
@@ -42,7 +54,30 @@
 const form = document.getElementById('login-form');
 const btn = document.getElementById('btn-submit');
 const msg = document.getElementById('msg');
+let mode = 'login';
+let meta = {allow_register: false, invite_required: false};
 let lockTimer = null;
+
+function setMode(m) {
+  mode = m;
+  document.getElementById('tab-login').classList.toggle('active', m === 'login');
+  document.getElementById('tab-reg').classList.toggle('active', m === 'reg');
+  btn.textContent = m === 'reg' ? '注册并进入控制台' : '登录';
+  document.getElementById('inv-wrap').style.display = (m === 'reg' && meta.invite_required) ? 'block' : 'none';
+  msg.textContent = '';
+}
+
+(async () => {
+  try {
+    const r = await fetch('/api/auth/meta');
+    if (r.ok) {
+      meta = await r.json();
+      if (meta.allow_register) {
+        document.getElementById('auth-tabs').classList.add('show');
+      }
+    }
+  } catch (e) {}
+})();
 
 function startCooldown(sec) {
   if (lockTimer) clearInterval(lockTimer);
@@ -68,6 +103,7 @@ form.addEventListener('submit', async (e) => {
   if (btn.disabled) return;
   const username = document.getElementById('username').value.trim();
   const password = document.getElementById('password').value;
+  const invite_code = document.getElementById('invite_code').value.trim();
   if (!username || !password) {
     msg.textContent = '请输入账号和密码';
     return;
@@ -76,15 +112,17 @@ form.addEventListener('submit', async (e) => {
   msg.className = 'msg';
   msg.textContent = '';
   try {
-    const r = await fetch('/api/login', {
+    const url = mode === 'reg' ? '/api/register' : '/api/login';
+    const body = mode === 'reg' ? {username, password, invite_code} : {username, password};
+    const r = await fetch(url, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({username, password})
+      body: JSON.stringify(body)
     });
     const d = await r.json().catch(() => ({}));
     if (r.ok && d.ok) {
       msg.className = 'msg ok';
-      msg.textContent = '登录成功，正在进入控制台…';
+      msg.textContent = (mode === 'reg' ? '注册成功，' : '登录成功，') + '正在进入控制台…';
       window.location.replace('/');
       return;
     }
@@ -92,7 +130,7 @@ form.addEventListener('submit', async (e) => {
       startCooldown(d.retry_after);
       return;
     }
-    msg.textContent = d.msg || '登录失败';
+    msg.textContent = d.msg || '操作失败';
   } catch (err) {
     msg.textContent = '网络请求失败，请检查服务是否在线';
   }

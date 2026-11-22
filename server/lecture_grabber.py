@@ -44,6 +44,7 @@ import statistics
 import threading
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from http.cookiejar import DefaultCookiePolicy
 
 import requests
 
@@ -118,43 +119,6 @@ EP = {
 
 STATUS_TEXT = {0: "全部", 1: "可报名(有余位)", 2: "已报满", 3: "未开始报名", 4: "已结束"}
 
-_session = requests.Session()
-_session.trust_env = False   # 忽略系统代理(抓包时的 mitmproxy), 抢课直连服务器, 降延迟
-try:                         # 扩大连接池: 多目标并发抢(每场 BURST 发)时全部复用热连接, 避免临时握手拖慢关键一发
-    from requests.adapters import HTTPAdapter
-    _adapter = HTTPAdapter(pool_connections=16, pool_maxsize=64)
-    _session.mount("https://", _adapter)
-    _session.mount("http://", _adapter)
-except Exception:
-    pass
-
-
-# ==================== 底层请求 ====================
-def _hdr_json(cookie=None):
-    ck = COOKIE if cookie is None else cookie
-    h = {"Authorization": AUTHORIZATION, "User-Agent": UA, "Referer": REFERER,
-         "Accept": "application/json, text/plain, */*",
-         "Accept-Encoding": "gzip, deflate",
-         "Content-Type": "application/json;charset=UTF-8"}
-    if ck:
-        h["Cookie"] = ck
-    if TOKEN:
-        h["token"] = TOKEN
-    return h
-
-
-def _hdr_form(cookie=None):
-    ck = COOKIE if cookie is None else cookie
-    h = {"Authorization": AUTHORIZATION, "User-Agent": UA, "Referer": REFERER,
-         "Accept": "application/json, text/plain, */*",
-         "Accept-Encoding": "gzip, deflate", "Origin": BASE}
-    if ck:
-        h["Cookie"] = ck
-    if TOKEN:
-        h["token"] = TOKEN
-    return h
-
-
 def _unwrap(resp):
     """把 requests.Response 解成后端 JSON 信封; 解析失败时返回原始文本。"""
     try:
@@ -164,74 +128,463 @@ def _unwrap(resp):
                 "http": resp.status_code}
 
 
+class TongjiClient:
+    """单用户隔离的同济高等讲堂 API 客户端 (独立 Cookie、学院缓存与 HTTP 连接池)。"""
+
+    def __init__(self, cookie="", token="", pool_connections=8, pool_maxsize=32):
+        self.cookie = (cookie or "").strip()
+        self.token = (token or "").strip()
+        self._college_lock = threading.Lock()
+        self._student_college = {"code": None, "name": None}
+        self._session = requests.Session()
+        self._session.trust_env = False  # 忽略系统代理(抓包时的 mitmproxy), 抢课直连服务器, 降延迟
+        try:
+            self._session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+        except Exception:
+            pass
+        try:
+            from requests.adapters import HTTPAdapter
+            adapter = HTTPAdapter(pool_connections=pool_connections, pool_maxsize=pool_maxsize)
+            self._session.mount("https://", adapter)
+            self._session.mount("http://", adapter)
+        except Exception:
+            pass
+
+    def set_cookie(self, cookie, token=None):
+        self.cookie = (cookie or "").strip()
+        if token is not None:
+            self.token = str(token).strip()
+        self.reset_student_cache()
+
+    def reset_student_cache(self):
+        with self._college_lock:
+            self._student_college["code"] = None
+            self._student_college["name"] = None
+
+    def _hdr_json(self, cookie=None):
+        ck = self.cookie if cookie is None else cookie
+        h = {"Authorization": AUTHORIZATION, "User-Agent": UA, "Referer": REFERER,
+             "Accept": "application/json, text/plain, */*",
+             "Accept-Encoding": "gzip, deflate",
+             "Content-Type": "application/json;charset=UTF-8"}
+        if ck:
+            h["Cookie"] = ck
+        if self.token:
+            h["token"] = self.token
+        return h
+
+    def _hdr_form(self, cookie=None):
+        ck = self.cookie if cookie is None else cookie
+        h = {"Authorization": AUTHORIZATION, "User-Agent": UA, "Referer": REFERER,
+             "Accept": "application/json, text/plain, */*",
+             "Accept-Encoding": "gzip, deflate", "Origin": BASE}
+        if ck:
+            h["Cookie"] = ck
+        if self.token:
+            h["token"] = self.token
+        return h
+
+    def get(self, path, params=None, cookie=None):
+        try:
+            r = self._session.get(BASE + path, params=params, headers=self._hdr_json(cookie=cookie), timeout=TIMEOUT)
+            return _unwrap(r)
+        except requests.RequestException as e:
+            return {"state": "error", "msg": "请求异常: %s" % e}
+
+    def post_form(self, path, fields):
+        try:
+            files = {k: (None, str(v)) for k, v in fields.items()}
+            r = self._session.post(BASE + path, files=files, headers=self._hdr_form(), timeout=TIMEOUT)
+            return _unwrap(r)
+        except requests.RequestException as e:
+            return {"state": "error", "msg": "请求异常: %s" % e}
+
+    def api_student_info(self, cookie=None):
+        return self.get(EP["StudentInfo"], cookie=cookie)
+
+    def api_is_finish_face(self):
+        return self.get(EP["IsFinishFace"])
+
+    def api_hall_num(self):
+        return self.get(EP["HallNum"])
+
+    def api_hall_list(self, page=1, page_size=10, status=0, time_=0, class_level=0):
+        return self.get(EP["HallList"], {"page": page, "pageSize": page_size,
+                                         "status": status, "time": time_, "classLevel": class_level})
+
+    def api_hall(self, data_id):
+        return self.get(EP["Hall"], {"DataId": data_id})
+
+    def api_hall30(self):
+        return self.get(EP["Hall30"])
+
+    def api_month_hall(self, year, month):
+        return self.get(EP["MonthHall"], {"year": year, "month": month})
+
+    def api_set_credentials(self, data_id):
+        return self.post_form(EP["SetCred"], {"dataId": data_id})
+
+    def api_get_credentials(self, code):
+        return self.post_form(EP["GetCred"], {"code": code})
+
+    def api_signup(self, code):
+        return self.post_form(EP["SignUp"], {"code": code})
+
+    def api_signin_time(self, data_id):
+        return self.post_form(EP["SignInTime"], {"dataId": data_id})
+
+    def api_cancel(self, data_id):
+        return self.post_form(EP["Cancel"], {"dataId": data_id})
+
+    def server_offset(self, samples=CLOCK_SAMPLES):
+        offs = []
+        for _ in range(samples):
+            t0 = time.time()
+            r = self.api_hall_list(page=1, page_size=1, status=0)
+            t1 = time.time()
+            nt = (r.get("data") or {}).get("nowtime") if isinstance(r, dict) else None
+            srv = _parse_iso_epoch(nt) if nt else None
+            if srv:
+                offs.append(srv - (t0 + t1) / 2.0)
+                continue
+            try:
+                rr = self._session.get(BASE + "/", headers={"User-Agent": UA}, timeout=TIMEOUT)
+                d = rr.headers.get("Date")
+                t2 = time.time()
+                if d:
+                    srv = calendar.timegm(time.strptime(d, "%a, %d %b %Y %H:%M:%S GMT"))
+                    offs.append(srv - (t0 + t2) / 2.0)
+            except requests.RequestException:
+                continue
+        return statistics.median(offs) if offs else 0.0
+
+    def my_college(self):
+        with self._college_lock:
+            if self._student_college["code"] is not None:
+                return self._student_college["code"], self._student_college["name"]
+        info = (self.api_student_info().get("data") or {})
+        code = str(info.get("Faculty") or info.get("CollegeCode") or "")
+        name = str(info.get("FacultyNmae") or info.get("CollegeCodeName") or "")
+        if code or info:
+            with self._college_lock:
+                self._student_college["code"] = code
+                self._student_college["name"] = name
+        return code, name
+
+    def scan_lectures_ex(self, statuses=(0,), max_pages=3, page_size=50, stop_when_ended=False):
+        all_rows = []
+        for status in statuses:
+            page = 1
+            while page <= max_pages:
+                r = self.api_hall_list(page=page, page_size=page_size, status=status)
+                if not token_alive(r):
+                    return "dead", str(r.get("msg") or "未登录/超时"), None
+                if not isinstance(r, dict) or r.get("state") == "error":
+                    if not all_rows:
+                        return "error", str((r or {}).get("msg") or "扫描请求异常"), None
+                    break
+                data = r.get("data") or {}
+                rows = data.get("row") or []
+                if not rows:
+                    break
+                for x in rows:
+                    x["_q"] = status
+                all_rows.extend(rows)
+                try:
+                    total_page = int(data.get("totalPage") or 0)
+                except (TypeError, ValueError):
+                    total_page = 0
+                if len(rows) < page_size or (total_page > 0 and page >= total_page):
+                    break
+                if stop_when_ended and len(rows) >= 10 and all(x.get("LectureHallStatus") == 4 for x in rows[-10:]):
+                    break
+                page += 1
+        seen, uniq = set(), []
+        for x in all_rows:
+            did = x.get("DataId") or x.get("dataId")
+            if did in seen:
+                continue
+            seen.add(did)
+            uniq.append(x)
+        return "ok", "", uniq
+
+    def _acquire_code(self, data_id):
+        sc = self.api_set_credentials(data_id)
+        code = (sc.get("data") or {}).get("code") if isinstance(sc, dict) else None
+        return code, sc
+
+    def _confirm_signup(self, data_id, tries=6, delay=1.0, P=None):
+        def _p(s):
+            if P:
+                P(s)
+        last = "未确认"
+        for i in range(max(1, tries)):
+            try:
+                chk = self.api_signin_time(data_id)
+                dat = (chk.get("data") or {}) if isinstance(chk, dict) else {}
+                s2 = dat.get("state")
+                if s2 in (1, "1"):
+                    return True, "GetSginInTime.state=1 signUpTime=%s" % dat.get("signUpTime")
+                dd = (self.api_hall(data_id).get("data") or {})
+                xs = dd.get("XSSigningUp")
+                if xs:
+                    return True, "XSSigningUp=%s (我的报名时间非空)" % xs
+                if s2 in (-1, "-1"):
+                    return False, "GetSginInTime.state=-1 报名失败 msg=%s" % (
+                        chk.get("msg") if isinstance(chk, dict) else "")
+                last = "GetSginInTime.state=%s signUpTime=%s XSSigningUp=%s" % (
+                    s2, dat.get("signUpTime"), xs)
+            except Exception as e:
+                last = "确认异常: %s" % e
+            if i < tries - 1:
+                _p("  确认中(%d/%d): %s, %.1fs后重试" % (i + 1, tries, last, delay))
+                time.sleep(delay)
+        return False, last
+
+    def grab_one(self, data_id, off, force=False, tag="", cancel_check=None, return_reason=False, log_fn=None):
+        def P(s):
+            if log_fn:
+                log_fn(tag + s)
+            else:
+                print(tag + s)
+
+        def _ret(ok, reason):
+            return (ok, reason) if return_reason else ok
+
+        d = self.api_hall(data_id)
+        dd = d.get("data") or {}
+        if not token_alive(d):
+            P("[!!] 拉取详情时登录凭据失效。")
+            return _ret(False, "cookie_dead")
+        tsu = dd.get("TimeSigningUp")
+        status = dd.get("LectureHallStatus")
+        target = parse_cn_epoch(tsu)
+        P("[i] 讲座=%s" % str(dd.get("Cathedra") or "")[:40])
+        P("[i] 状态=%s(%s) 报名开始 TimeSigningUp=%s 已报/容量=%s/%s" % (
+            status, status_name(dd), tsu, dd.get("SignupNum"), dd.get("Capacity")))
+        if status == 4:
+            P("[!] 该场已结束(状态4), 跳过。")
+            return _ret(False, "expired")
+        if target:
+            P("    距报名开始还有 %.1f 秒 (服务器时间)" % (target - srv_now(off)))
+
+        code, sc = self._acquire_code(data_id)
+        if code:
+            gc = self.api_get_credentials(code)
+            P("[✓] 已预取 credentialsCode=%s 当前 iscode=%s" % (
+                code, (gc.get("data") or {}).get("iscode")))
+        else:
+            P("[i] 暂未取到 code (msg=%s)。报名未开始属正常, 将在开火时刻重试获取。" % sc.get("msg"))
+            if not token_alive(sc):
+                return _ret(False, "cookie_dead")
+            if "无报名资格" in str(sc.get("msg", "")) and target and srv_now(off) >= target and not force:
+                P("[!] 报名已开始却仍'无报名资格!': 很可能院级限本院, 或你不符合条件。加 --force 强行尝试, 或换校级场次。")
+                return _ret(False, "hard_fail")
+
+        if target:
+            P("[..] 等待报名开启 (提前 %.2fs 开火)..." % LEAD)
+            last_refresh = time.time()
+            while srv_now(off) < target - LEAD:
+                if cancel_check and cancel_check():
+                    P("[i] 目标已被取消, 退出等待。")
+                    return _ret(False, "cancelled")
+                remain = target - LEAD - srv_now(off)
+                time.sleep(min(remain, 0.5) if remain > 0.5 else max(remain, 0))
+                gap = 1 if remain < 10 else (2 if remain < 30 else 5)
+                if remain < 30 and time.time() - last_refresh > gap:
+                    if not code:
+                        code, sc = self._acquire_code(data_id)
+                        if code:
+                            P("[✓] 窗口临近取到 code=%s" % code)
+                    else:
+                        gc = self.api_get_credentials(code)
+                        if (gc.get("data") or {}).get("iscode"):
+                            P("[✓] iscode=true, 凭证已激活!")
+                    last_refresh = time.time()
+            fire_start = max(target, srv_now(off))
+        else:
+            P("[!] 未拿到 TimeSigningUp, 立即开火 (适合已开放/手动触发场景)。")
+            fire_start = srv_now(off)
+
+        deadline = fire_start + GRAB_DEADLINE
+        P("\n>>> 开火! 窗口 %ds, 每轮 %d 发, 间隔 %.2fs <<<" % (GRAB_DEADLINE, BURST, VOLLEY_INTERVAL))
+        volley = 0
+        seen_msgs = {}
+        success = False
+        submitted = False
+        stop_reason = None
+        volley_timeout = min(0.8, TIMEOUT)
+        ex = ThreadPoolExecutor(max_workers=BURST * 2)
+        try:
+            while srv_now(off) < deadline and not success and not submitted:
+                if cancel_check and cancel_check():
+                    P("[i] 目标已被取消, 中止猛攻。")
+                    return _ret(False, "cancelled")
+                volley += 1
+                if not code:
+                    code, sc = self._acquire_code(data_id)
+                    if not code:
+                        m = str(sc.get("msg", ""))
+                        seen_msgs["[SetCred]" + m] = seen_msgs.get("[SetCred]" + m, 0) + 1
+                        if not token_alive(sc):
+                            P("[!!] 登录凭据失效, 中止。")
+                            return _ret(False, "cookie_dead")
+                        if volley % 5 == 1:
+                            P("  第%d轮 仍无code(msg=%s) 剩余%.1fs" % (volley, m, deadline - srv_now(off)))
+                        time.sleep(VOLLEY_INTERVAL)
+                        continue
+                    P("[✓] 开火时刻取到 code=%s, 开始猛攻报名!" % code)
+
+                futs = [ex.submit(self.api_signup, code) for _ in range(BURST)]
+                try:
+                    for f in as_completed(futs, timeout=volley_timeout):
+                        try:
+                            r = f.result()
+                        except Exception as e:
+                            r = {"state": "error", "msg": str(e)}
+                        state = r.get("state")
+                        msg = str(r.get("msg", ""))
+                        seen_msgs[msg] = seen_msgs.get(msg, 0) + 1
+                        if not token_alive(r):
+                            P("[!!] 登录凭据失效, 中止。请重新抓取。")
+                            return _ret(False, "cookie_dead")
+                        if state == "success":
+                            P("\n[i] 收到 SignUp success 回执, 停火 → 转权威确认(GetSginInTime.data.state==1)…")
+                            submitted = True
+                            break
+                        if "已报名" in msg or "已经报名" in msg or "重复" in msg:
+                            P("\n[✓] 已在报名名单中 (msg=%s), 停止。" % msg)
+                            success = True
+                            break
+                        if ("已满" in msg) or ("无余位" in msg) or ("报满" in msg) or ("名额" in msg and "满" in msg):
+                            P("\n[x] 名额已满 (msg=%s), 停止本轮。" % msg)
+                            stop_reason = "full_or_timeout"
+                            break
+                        if ("人脸" in msg) or ("认证" in msg and "完成" in msg):
+                            P("\n[x] 被前置条件拦截 (msg=%s)。请先在微信完成人脸录入。" % msg)
+                            stop_reason = "hard_fail"
+                            break
+                except FuturesTimeoutError:
+                    seen_msgs["[单轮超时]"] = seen_msgs.get("[单轮超时]", 0) + 1
+                if success or submitted or stop_reason:
+                    break
+                if volley % 10 == 1:
+                    top = sorted(seen_msgs.items(), key=lambda kv: -kv[1])[:3]
+                    P("  第%d轮 t=%s 剩余%.1fs 最近msg:%s" % (
+                        volley, cn_str(srv_now(off)), deadline - srv_now(off), top))
+                if code and volley % 20 == 0:
+                    nc, _ = self._acquire_code(data_id)
+                    if nc:
+                        code = nc
+                time.sleep(VOLLEY_INTERVAL)
+        finally:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)
+
+        if stop_reason == "hard_fail":
+            return _ret(False, "hard_fail")
+        if stop_reason == "full_or_timeout":
+            return _ret(False, "full_or_timeout")
+
+        P("\n--- 猛攻结束 --- submitted=%s 已报名回执=%s" % (submitted, success))
+        P("出现过的 msg 统计: %s" % json.dumps(seen_msgs, ensure_ascii=False))
+        hard_ineligible = (not success and not submitted
+                           and any("无报名资格" in m for m in seen_msgs)
+                           and not any(("已满" in m or "余位" in m) for m in seen_msgs))
+        if hard_ineligible:
+            P("[!] 全程'无报名资格!': 该讲座很可能限本院/本人不符合条件, 换一场校级(ClassLevel=1)讲座。")
+        tries = 8 if (submitted or success) else 2
+        okc, ev = self._confirm_signup(data_id, tries=tries, delay=1.0, P=P)
+        dd2 = (self.api_hall(data_id).get("data") or {})
+        P("最终状态: %s 我的报名时间 XSSigningUp: %s" % (status_name(dd2), dd2.get("XSSigningUp")))
+        final_ok = bool(okc or success)
+        if final_ok:
+            P("\n[★★★] 报名成功(已确认): %s" % (ev if okc else "名单已含本人(msg=已报名)"))
+            return _ret(True, "success")
+        P("\n[x] 未确认报名成功(%s) — 不计为抢到, 避免误报。" % ev)
+        if dd2.get("LectureHallStatus") == 4:
+            return _ret(False, "expired")
+        return _ret(False, "hard_fail" if (hard_ineligible and not force) else "full_or_timeout")
+
+
+_DEFAULT_CLIENT = TongjiClient(cookie=COOKIE, token=TOKEN, pool_connections=16, pool_maxsize=64)
+
+
+def _dc():
+    if _DEFAULT_CLIENT.cookie != COOKIE:
+        _DEFAULT_CLIENT.cookie = COOKIE
+    if _DEFAULT_CLIENT.token != TOKEN:
+        _DEFAULT_CLIENT.token = TOKEN
+    return _DEFAULT_CLIENT
+
+
+def _hdr_json(cookie=None):
+    return _dc()._hdr_json(cookie=cookie)
+
+
+def _hdr_form(cookie=None):
+    return _dc()._hdr_form(cookie=cookie)
+
+
 def get(path, params=None, cookie=None):
-    try:
-        r = _session.get(BASE + path, params=params, headers=_hdr_json(cookie=cookie), timeout=TIMEOUT)
-        return _unwrap(r)
-    except requests.RequestException as e:
-        return {"state": "error", "msg": "请求异常: %s" % e}
+    return _dc().get(path, params=params, cookie=cookie)
 
 
 def post_form(path, fields):
-    try:
-        # 用 files= 强制 multipart/form-data(带 boundary), 与前端 new FormData 一致
-        files = {k: (None, str(v)) for k, v in fields.items()}
-        r = _session.post(BASE + path, files=files, headers=_hdr_form(), timeout=TIMEOUT)
-        return _unwrap(r)
-    except requests.RequestException as e:
-        return {"state": "error", "msg": "请求异常: %s" % e}
+    return _dc().post_form(path, fields)
 
 
 # ==================== 业务 API 封装 ====================
 def api_student_info(cookie=None):
-    return get(EP["StudentInfo"], cookie=cookie)
+    return _dc().api_student_info(cookie=cookie)
 
 
 def api_is_finish_face():
-    return get(EP["IsFinishFace"])
+    return _dc().api_is_finish_face()
 
 
 def api_hall_num():
-    return get(EP["HallNum"])
+    return _dc().api_hall_num()
 
 
 def api_hall_list(page=1, page_size=10, status=0, time_=0, class_level=0):
-    return get(EP["HallList"], {"page": page, "pageSize": page_size,
-                                "status": status, "time": time_, "classLevel": class_level})
+    return _dc().api_hall_list(page=page, page_size=page_size, status=status, time_=time_, class_level=class_level)
 
 
 def api_hall(data_id):
-    return get(EP["Hall"], {"DataId": data_id})
+    return _dc().api_hall(data_id)
 
 
 def api_hall30():
-    return get(EP["Hall30"])
+    return _dc().api_hall30()
 
 
 def api_month_hall(year, month):
-    return get(EP["MonthHall"], {"year": year, "month": month})
+    return _dc().api_month_hall(year, month)
 
 
 def api_set_credentials(data_id):
-    return post_form(EP["SetCred"], {"dataId": data_id})
+    return _dc().api_set_credentials(data_id)
 
 
 def api_get_credentials(code):
-    return post_form(EP["GetCred"], {"code": code})
+    return _dc().api_get_credentials(code)
 
 
 def api_signup(code):
     """【报名动作】"""
-    return post_form(EP["SignUp"], {"code": code})
+    return _dc().api_signup(code)
 
 
 def api_signin_time(data_id):
     """轮询报名/签到结果: data.state==1 报名成功"""
-    return post_form(EP["SignInTime"], {"dataId": data_id})
+    return _dc().api_signin_time(data_id)
 
 
 def api_cancel(data_id):
-    return post_form(EP["Cancel"], {"dataId": data_id})
+    return _dc().api_cancel(data_id)
 
 
 # ==================== 服务器时钟同步 ====================
@@ -247,28 +600,7 @@ def _parse_iso_epoch(s):
 
 
 def server_offset(samples=CLOCK_SAMPLES):
-    """优先用 GetLectureHallList 的 data.nowtime(带亚秒+时区)同步, 回退 HTTP Date 头。
-    返回 (服务器UTC纪元 - 本机纪元) 的中位数, 抵消本机时钟偏差。"""
-    offs = []
-    for _ in range(samples):
-        t0 = time.time()
-        r = api_hall_list(page=1, page_size=1, status=0)
-        t1 = time.time()
-        nt = (r.get("data") or {}).get("nowtime") if isinstance(r, dict) else None
-        srv = _parse_iso_epoch(nt) if nt else None
-        if srv:
-            offs.append(srv - (t0 + t1) / 2.0)
-            continue
-        try:                              # 回退: HTTP Date
-            rr = _session.get(BASE + "/", headers={"User-Agent": UA}, timeout=TIMEOUT)
-            d = rr.headers.get("Date")
-            t2 = time.time()
-            if d:
-                srv = calendar.timegm(time.strptime(d, "%a, %d %b %Y %H:%M:%S GMT"))
-                offs.append(srv - (t0 + t2) / 2.0)
-        except requests.RequestException:
-            continue
-    return statistics.median(offs) if offs else 0.0
+    return _dc().server_offset(samples=samples)
 
 
 def srv_now(off):
@@ -312,23 +644,14 @@ def token_alive(resp):
     return not (("未登录" in msg) or ("超时" in msg) or (code in (40001, "40001")))
 
 
-_STUDENT_COLLEGE = {"code": None, "name": None}
-
-
 def reset_student_cache():
     """Cookie 变更时清空学院缓存, 避免跨账号沿用旧学院。"""
-    _STUDENT_COLLEGE["code"] = None
-    _STUDENT_COLLEGE["name"] = None
+    _dc().reset_student_cache()
 
 
 def my_college():
-    """返回 (学生学院代码, 学院名) —— 用于院级'只抢本院'资格过滤。带缓存。
-    实测: 讲座 CollegeCode 与学生 Faculty 同一编码体系(如 000722=计算机科学与技术学院)。"""
-    if _STUDENT_COLLEGE["code"] is None:
-        info = (api_student_info().get("data") or {})
-        _STUDENT_COLLEGE["code"] = str(info.get("Faculty") or info.get("CollegeCode") or "")
-        _STUDENT_COLLEGE["name"] = str(info.get("FacultyNmae") or info.get("CollegeCodeName") or "")
-    return _STUDENT_COLLEGE["code"], _STUDENT_COLLEGE["name"]
+    """返回 (学生学院代码, 学院名) —— 用于院级'只抢本院'资格过滤。带缓存。"""
+    return _dc().my_college()
 
 
 def dump(obj, name):
@@ -412,44 +735,8 @@ def cmd_discover():
 
 # ==================== 命令: find ====================
 def scan_lectures_ex(statuses=(0,), max_pages=3, page_size=50, stop_when_ended=False):
-    """扫描讲座列表, 去重返回 (status, msg, rows)。
-    status: 'ok' | 'dead'(token明确失效) | 'error'(网络/非JSON抖动, 不判token失效)。
-    使用较大 page_size 减少串行往返; stop_when_ended=True 时尾部已连续出现已结束场次即提前止步。"""
-    all_rows = []
-    for status in statuses:
-        page = 1
-        while page <= max_pages:
-            r = api_hall_list(page=page, page_size=page_size, status=status)
-            if not token_alive(r):
-                return "dead", str(r.get("msg") or "未登录/超时"), None
-            if not isinstance(r, dict) or r.get("state") == "error":
-                if not all_rows:
-                    return "error", str((r or {}).get("msg") or "扫描请求异常"), None
-                break
-            data = r.get("data") or {}
-            rows = data.get("row") or []
-            if not rows:
-                break
-            for x in rows:
-                x["_q"] = status
-            all_rows.extend(rows)
-            try:
-                total_page = int(data.get("totalPage") or 0)
-            except (TypeError, ValueError):
-                total_page = 0
-            if len(rows) < page_size or (total_page > 0 and page >= total_page):
-                break
-            if stop_when_ended and len(rows) >= 10 and all(x.get("LectureHallStatus") == 4 for x in rows[-10:]):
-                break
-            page += 1
-    seen, uniq = set(), []
-    for x in all_rows:
-        did = x.get("DataId") or x.get("dataId")
-        if did in seen:
-            continue
-        seen.add(did)
-        uniq.append(x)
-    return "ok", "", uniq
+    return _dc().scan_lectures_ex(statuses=statuses, max_pages=max_pages,
+                                  page_size=page_size, stop_when_ended=stop_when_ended)
 
 
 def scan_lectures(statuses=(0,), max_pages=3, page_size=50, stop_when_ended=False):
@@ -595,15 +882,8 @@ def cmd_detail(data_id):
 
 
 # ==================== 命令: grab ====================
-def _fire_signup(code):
-    return api_signup(code)
-
-
 def _acquire_code(data_id):
-    """尝试获取动态凭证 code。返回 (code, resp)。窗口未开/无资格时 code 为 None。"""
-    sc = api_set_credentials(data_id)
-    code = (sc.get("data") or {}).get("code") if isinstance(sc, dict) else None
-    return code, sc
+    return _dc()._acquire_code(data_id)
 
 
 def _preflight(force):
@@ -623,212 +903,11 @@ def _preflight(force):
 
 
 def _confirm_signup(data_id, tries=6, delay=1.0, P=None):
-    """报名提交后的【权威确认】: 唯一可靠信号 = GetSginInTime.data.state==1(含 signUpTime);
-    详情 XSSigningUp(我的报名时间)非空作辅助。SignUp 回执 state=='success' 只表示"提交成功",
-    讲座已满/未真正入名单时它也可能回 success 而 data.state 仍是 0/-1, 故绝不据回执判成功。
-    返回 (confirmed: bool, evidence: str)。轮询 tries 次、每次间隔 delay 秒, 容忍读超时抖动。"""
-    def _p(s):
-        if P:
-            P(s)
-    last = "未确认"
-    for i in range(max(1, tries)):
-        try:
-            chk = api_signin_time(data_id)
-            dat = (chk.get("data") or {}) if isinstance(chk, dict) else {}
-            s2 = dat.get("state")
-            if s2 in (1, "1"):
-                return True, "GetSginInTime.state=1 signUpTime=%s" % dat.get("signUpTime")
-            dd = (api_hall(data_id).get("data") or {})
-            xs = dd.get("XSSigningUp")
-            if xs:
-                return True, "XSSigningUp=%s (我的报名时间非空)" % xs
-            if s2 in (-1, "-1"):
-                return False, "GetSginInTime.state=-1 报名失败 msg=%s" % (
-                    chk.get("msg") if isinstance(chk, dict) else "")
-            last = "GetSginInTime.state=%s signUpTime=%s XSSigningUp=%s" % (
-                s2, dat.get("signUpTime"), xs)
-        except Exception as e:
-            last = "确认异常: %s" % e
-        if i < tries - 1:
-            _p("  确认中(%d/%d): %s, %.1fs后重试" % (i + 1, tries, last, delay))
-            time.sleep(delay)
-    return False, last
+    return _dc()._confirm_signup(data_id, tries=tries, delay=delay, P=P)
 
 
 def grab_one(data_id, off, force=False, tag="", cancel_check=None, return_reason=False):
-    """抢报单个讲座: 拉详情 -> 等到 TimeSigningUp -> 并发猛攻。
-    return_reason=False: 返回 True=报名成功/已在名单, False=未成功。
-    return_reason=True : 返回 (ok: bool, reason: str), reason 取值:
-      'success' | 'cancelled' | 'expired' | 'cookie_dead' | 'hard_fail' | 'full_or_timeout'。"""
-    def P(s):
-        print(tag + s)
-
-    def _ret(ok, reason):
-        return (ok, reason) if return_reason else ok
-
-    d = api_hall(data_id)
-    dd = d.get("data") or {}
-    if not token_alive(d):
-        P("[!!] 拉取详情时登录凭据失效。")
-        return _ret(False, "cookie_dead")
-    tsu = dd.get("TimeSigningUp")
-    status = dd.get("LectureHallStatus")
-    target = parse_cn_epoch(tsu)
-    P("[i] 讲座=%s" % str(dd.get("Cathedra") or "")[:40])
-    P("[i] 状态=%s(%s) 报名开始 TimeSigningUp=%s 已报/容量=%s/%s" % (
-        status, status_name(dd), tsu, dd.get("SignupNum"), dd.get("Capacity")))
-    if status == 4:
-        P("[!] 该场已结束(状态4), 跳过。")
-        return _ret(False, "expired")
-    if target:
-        P("    距报名开始还有 %.1f 秒 (服务器时间)" % (target - srv_now(off)))
-
-    # 预取动态凭证 (窗口未开时可能返回"无报名资格!", 不阻塞, 开火时再取)
-    code, sc = _acquire_code(data_id)
-    if code:
-        gc = api_get_credentials(code)
-        P("[✓] 已预取 credentialsCode=%s 当前 iscode=%s" % (
-            code, (gc.get("data") or {}).get("iscode")))
-    else:
-        P("[i] 暂未取到 code (msg=%s)。报名未开始属正常, 将在开火时刻重试获取。" % sc.get("msg"))
-        if not token_alive(sc):
-            return _ret(False, "cookie_dead")
-        if "无报名资格" in str(sc.get("msg", "")) and target and srv_now(off) >= target and not force:
-            P("[!] 报名已开始却仍'无报名资格!': 很可能院级限本院, 或你不符合条件。加 --force 强行尝试, 或换校级场次。")
-            return _ret(False, "hard_fail")
-
-    # 等待到报名开始
-    if target:
-        P("[..] 等待报名开启 (提前 %.2fs 开火)..." % LEAD)
-        last_refresh = time.time()
-        while srv_now(off) < target - LEAD:
-            if cancel_check and cancel_check():
-                P("[i] 目标已被取消, 退出等待。")
-                return _ret(False, "cancelled")
-            remain = target - LEAD - srv_now(off)
-            time.sleep(min(remain, 0.5) if remain > 0.5 else max(remain, 0))
-            gap = 1 if remain < 10 else (2 if remain < 30 else 5)   # 越临近开抢, 预取 code 越密
-            if remain < 30 and time.time() - last_refresh > gap:
-                if not code:
-                    code, sc = _acquire_code(data_id)
-                    if code:
-                        P("[✓] 窗口临近取到 code=%s" % code)
-                else:
-                    gc = api_get_credentials(code)
-                    if (gc.get("data") or {}).get("iscode"):
-                        P("[✓] iscode=true, 凭证已激活!")
-                last_refresh = time.time()
-        fire_start = max(target, srv_now(off))   # 目标时刻已过(手动抢已开放场)则立即开火, 而非用过去的 deadline 空跑
-    else:
-        P("[!] 未拿到 TimeSigningUp, 立即开火 (适合已开放/手动触发场景)。")
-        fire_start = srv_now(off)
-
-    # 猛攻: 独立线程池 + as_completed(timeout), 避免单个丢包超时卡死整轮或退出时阻塞
-    deadline = fire_start + GRAB_DEADLINE
-    P("\n>>> 开火! 窗口 %ds, 每轮 %d 发, 间隔 %.2fs <<<" % (GRAB_DEADLINE, BURST, VOLLEY_INTERVAL))
-    volley = 0
-    seen_msgs = {}
-    success = False
-    submitted = False          # 收到过 SignUp 'success' 回执(仅表示提交成功, 是否真报上待权威确认)
-    stop_reason = None
-    volley_timeout = min(0.8, TIMEOUT)
-    ex = ThreadPoolExecutor(max_workers=BURST * 3)
-    try:
-        while srv_now(off) < deadline and not success and not submitted:
-            if cancel_check and cancel_check():
-                P("[i] 目标已被取消, 中止猛攻。")
-                return _ret(False, "cancelled")
-            volley += 1
-            if not code:
-                code, sc = _acquire_code(data_id)
-                if not code:
-                    m = str(sc.get("msg", ""))
-                    seen_msgs["[SetCred]" + m] = seen_msgs.get("[SetCred]" + m, 0) + 1
-                    if not token_alive(sc):
-                        P("[!!] 登录凭据失效, 中止。")
-                        return _ret(False, "cookie_dead")
-                    if volley % 5 == 1:
-                        P("  第%d轮 仍无code(msg=%s) 剩余%.1fs" % (volley, m, deadline - srv_now(off)))
-                    time.sleep(VOLLEY_INTERVAL)
-                    continue
-                P("[✓] 开火时刻取到 code=%s, 开始猛攻报名!" % code)
-
-            futs = [ex.submit(_fire_signup, code) for _ in range(BURST)]
-            try:
-                for f in as_completed(futs, timeout=volley_timeout):
-                    try:
-                        r = f.result()
-                    except Exception as e:
-                        r = {"state": "error", "msg": str(e)}
-                    state = r.get("state")
-                    msg = str(r.get("msg", ""))
-                    seen_msgs[msg] = seen_msgs.get(msg, 0) + 1
-                    if not token_alive(r):
-                        P("[!!] 登录凭据失效, 中止。请重新抓取。")
-                        return _ret(False, "cookie_dead")
-                    if state == "success":
-                        # SignUp 回执 success 仅表示"提交成功", 不代表已入名单(已满时也可能回 success 而
-                        # GetSginInTime.data.state 仍为 0/-1)。停火, 交由循环后的权威确认判定, 杜绝误报抢到。
-                        P("\n[i] 收到 SignUp success 回执, 停火 → 转权威确认(GetSginInTime.data.state==1)…")
-                        submitted = True
-                        break
-                    if "已报名" in msg or "已经报名" in msg or "重复" in msg:
-                        P("\n[✓] 已在报名名单中 (msg=%s), 停止。" % msg)
-                        success = True
-                        break
-                    if ("已满" in msg) or ("无余位" in msg) or ("报满" in msg) or ("名额" in msg and "满" in msg):
-                        P("\n[x] 名额已满 (msg=%s), 停止本轮。" % msg)
-                        stop_reason = "full_or_timeout"
-                        break
-                    if ("人脸" in msg) or ("认证" in msg and "完成" in msg):
-                        P("\n[x] 被前置条件拦截 (msg=%s)。请先在微信完成人脸录入。" % msg)
-                        stop_reason = "hard_fail"
-                        break
-            except FuturesTimeoutError:
-                seen_msgs["[单轮超时]"] = seen_msgs.get("[单轮超时]", 0) + 1
-            if success or submitted or stop_reason:
-                break
-            if volley % 10 == 1:
-                top = sorted(seen_msgs.items(), key=lambda kv: -kv[1])[:3]
-                P("  第%d轮 t=%s 剩余%.1fs 最近msg:%s" % (
-                    volley, cn_str(srv_now(off)), deadline - srv_now(off), top))
-            if code and volley % 20 == 0:
-                nc, _ = _acquire_code(data_id)
-                if nc:
-                    code = nc
-            time.sleep(VOLLEY_INTERVAL)
-    finally:
-        try:
-            ex.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            ex.shutdown(wait=False)
-
-    if stop_reason == "hard_fail":
-        return _ret(False, "hard_fail")
-    if stop_reason == "full_or_timeout":
-        return _ret(False, "full_or_timeout")
-
-    P("\n--- 猛攻结束 --- submitted=%s 已报名回执=%s" % (submitted, success))
-    P("出现过的 msg 统计: %s" % json.dumps(seen_msgs, ensure_ascii=False))
-    hard_ineligible = (not success and not submitted
-                       and any("无报名资格" in m for m in seen_msgs)
-                       and not any(("已满" in m or "余位" in m) for m in seen_msgs))
-    if hard_ineligible:
-        P("[!] 全程'无报名资格!': 该讲座很可能限本院/本人不符合条件, 换一场校级(ClassLevel=1)讲座。")
-    # 【权威确认】唯一决定是否算抢到: 轮询 GetSginInTime.data.state==1 / 详情 XSSigningUp 非空。
-    # 提交过(submitted)或收到"已报名"(success)时多轮询几次等状态落定; 否则只兜底查 2 次。
-    tries = 8 if (submitted or success) else 2
-    okc, ev = _confirm_signup(data_id, tries=tries, delay=1.0, P=P)
-    dd2 = (api_hall(data_id).get("data") or {})
-    P("最终状态: %s 我的报名时间 XSSigningUp: %s" % (status_name(dd2), dd2.get("XSSigningUp")))
-    final_ok = bool(okc or success)     # success 仅在服务端明确回"已报名"时为真, 属权威信号
-    if final_ok:
-        P("\n[★★★] 报名成功(已确认): %s" % (ev if okc else "名单已含本人(msg=已报名)"))
-        return _ret(True, "success")
-    P("\n[x] 未确认报名成功(%s) — 不计为抢到, 避免误报。" % ev)
-    if dd2.get("LectureHallStatus") == 4:
-        return _ret(False, "expired")
-    return _ret(False, "hard_fail" if (hard_ineligible and not force) else "full_or_timeout")
+    return _dc().grab_one(data_id, off, force=force, tag=tag, cancel_check=cancel_check, return_reason=return_reason)
 
 
 def cmd_grab(data_ids, force=False):

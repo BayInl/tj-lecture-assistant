@@ -12,7 +12,11 @@ import (
 
 // ServerStatus mirrors the JSON payload of GET /api/status.
 type ServerStatus struct {
-	Now    string `json:"now"`
+	Now  string `json:"now"`
+	User struct {
+		Username string `json:"username"`
+		Role     string `json:"role"`
+	} `json:"user"`
 	Cookie struct {
 		Present    bool   `json:"present"`
 		SessionID  string `json:"session_id"`

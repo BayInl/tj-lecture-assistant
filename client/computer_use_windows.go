@@ -34,6 +34,7 @@ var (
 	procEmptyClipboard    = user32DLL.NewProc("EmptyClipboard")
 	procSetClipboardData  = user32DLL.NewProc("SetClipboardData")
 	procGlobalAlloc       = kernel32DLL.NewProc("GlobalAlloc")
+	procGlobalFree        = kernel32DLL.NewProc("GlobalFree")
 	procGlobalLock        = kernel32DLL.NewProc("GlobalLock")
 	procGlobalUnlock      = kernel32DLL.NewProc("GlobalUnlock")
 	procRtlMoveMemory     = kernel32DLL.NewProc("RtlMoveMemory")
@@ -116,6 +117,7 @@ func setWinClipboardText(text string) error {
 
 	ok, _, _ := procOpenClipboard.Call(0)
 	if ok == 0 {
+		_, _, _ = procGlobalFree.Call(hMem)
 		return errors.New("打开剪贴板失败")
 	}
 	defer func() { _, _, _ = procCloseClipboard.Call() }()

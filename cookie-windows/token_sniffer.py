@@ -21,8 +21,9 @@ from mitmproxy import http, ctx
 
 TARGET_HOST = "lecture.tongji.edu.cn"
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "token.json")
-DEBUG = os.path.join(HERE, "sniff_debug.log")
+OUT = os.environ.get("TJ_SNIFFER_OUT") or os.path.join(HERE, "token.json")
+DEBUG = os.environ.get("TJ_SNIFFER_LOG") or os.path.join(HERE, "sniff_debug.log")
+VERBOSE_DEBUG = os.environ.get("TJ_SNIFF_DEBUG") == "1"
 
 SESSION_KEY = "PG.ASP.Session.ID"
 WEIXIN_KEY = "PG.ASP.WeiXinCode.ID"
@@ -77,13 +78,18 @@ def _atomic_write(data):
         return False
 
 
+_LAST_RUN_COOKIE = ""
+
+
 def _write_cred(cookie, source, host):
-    """截获会话 Cookie -> token.json。Cookie 未变化则跳过(避免每请求刷屏)。"""
+    """截获会话 Cookie -> token.json。同一次嗅探运行内 Cookie 未变化则跳过(避免每请求刷屏)。"""
+    global _LAST_RUN_COOKIE
     if not cookie or SESSION_KEY not in cookie:
         return
-    ex = _load_existing()
-    if ex.get("cookie") == cookie:
+    if _LAST_RUN_COOKIE == cookie:
         return
+    _LAST_RUN_COOKIE = cookie
+    ex = _load_existing()
     data = {
         "cookie": cookie,
         "session_id": _cookie_val(cookie, SESSION_KEY),
@@ -133,9 +139,10 @@ class TokenSniffer:
             if not _interesting(path):
                 return
 
-            _log("REQ  %s %s" % (flow.request.method, flow.request.url))
-            _log("     headers= %s" % json.dumps(dict(flow.request.headers),
-                                                 ensure_ascii=False))
+            if VERBOSE_DEBUG:
+                _log("REQ  %s %s" % (flow.request.method, flow.request.url))
+                _log("     headers= %s" % json.dumps(dict(flow.request.headers),
+                                                     ensure_ascii=False))
 
             cookie = (flow.request.headers.get("Cookie")
                       or flow.request.headers.get("cookie"))
@@ -155,18 +162,21 @@ class TokenSniffer:
             if not _interesting(path):
                 return
 
-            _log("RESP %s %s -> %s" % (flow.request.method,
-                                        flow.request.url,
-                                        flow.response.status_code))
-            _log("     resp-headers= %s" % json.dumps(dict(flow.response.headers),
-                                                      ensure_ascii=False))
             body = ""
-            try:
-                body = flow.response.get_text(strict=False) or ""
-            except Exception:
-                body = ""
-            if body:
-                _log("     body[:2000]= %s" % body[:2000].replace("\n", " "))
+            need_body = ("callback" in path.lower()) or VERBOSE_DEBUG
+            if need_body:
+                try:
+                    body = flow.response.get_text(strict=False) or ""
+                except Exception:
+                    body = ""
+            if VERBOSE_DEBUG:
+                _log("RESP %s %s -> %s" % (flow.request.method,
+                                            flow.request.url,
+                                            flow.response.status_code))
+                _log("     resp-headers= %s" % json.dumps(dict(flow.response.headers),
+                                                          ensure_ascii=False))
+                if body:
+                    _log("     body[:2000]= %s" % body[:2000].replace("\n", " "))
 
             # weixinapi/Callback -> userInfo(学生信息)
             if "callback" in path.lower():
