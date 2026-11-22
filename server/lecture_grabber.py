@@ -129,15 +129,16 @@ def _unwrap(resp):
 
 
 class TongjiClient:
-    """单用户隔离的同济高等讲堂 API 客户端 (独立 Cookie、学院缓存与 HTTP 连接池)。"""
+    """单用户隔离的同济高等讲堂 API 客户端 (独立 Cookie、代理路由、学院缓存与 HTTP 连接池)。"""
 
-    def __init__(self, cookie="", token="", pool_connections=8, pool_maxsize=32):
+    def __init__(self, cookie="", token="", pool_connections=8, pool_maxsize=32, proxy_url=""):
         self.cookie = (cookie or "").strip()
         self.token = (token or "").strip()
+        self.proxy_url = ""
         self._college_lock = threading.Lock()
         self._student_college = {"code": None, "name": None}
         self._session = requests.Session()
-        self._session.trust_env = False  # 忽略系统代理(抓包时的 mitmproxy), 抢课直连服务器, 降延迟
+        self._session.trust_env = False  # 忽略系统代理(抓包时的 mitmproxy), 抢课默认直连, 降延迟
         try:
             self._session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
         except Exception:
@@ -149,6 +150,13 @@ class TongjiClient:
             self._session.mount("http://", adapter)
         except Exception:
             pass
+        self.set_proxy(proxy_url)
+
+    def set_proxy(self, proxy_url=""):
+        """为当前用户会话设置独立出口代理 (如 mihomo http://127.0.0.1:7891); 留空则直连。"""
+        p = (proxy_url or "").strip()
+        self.proxy_url = p
+        self._session.proxies = {"http": p, "https": p} if p else {}
 
     def set_cookie(self, cookie, token=None):
         self.cookie = (cookie or "").strip()
@@ -341,7 +349,8 @@ class TongjiClient:
                 time.sleep(delay)
         return False, last
 
-    def grab_one(self, data_id, off, force=False, tag="", cancel_check=None, return_reason=False, log_fn=None):
+    def grab_one(self, data_id, off, force=False, tag="", cancel_check=None, return_reason=False, log_fn=None,
+                 burst=None, volley_interval=None, lead=None, deadline_sec=None):
         def P(s):
             if log_fn:
                 log_fn(tag + s)
@@ -350,6 +359,11 @@ class TongjiClient:
 
         def _ret(ok, reason):
             return (ok, reason) if return_reason else ok
+
+        burst_n = max(1, int(burst if burst is not None else BURST))
+        v_interval = max(0.05, float(volley_interval if volley_interval is not None else VOLLEY_INTERVAL))
+        lead_sec = max(0.0, float(lead if lead is not None else LEAD))
+        deadline_win = max(5.0, float(deadline_sec if deadline_sec is not None else GRAB_DEADLINE))
 
         d = self.api_hall(data_id)
         dd = d.get("data") or {}
@@ -382,13 +396,13 @@ class TongjiClient:
                 return _ret(False, "hard_fail")
 
         if target:
-            P("[..] 等待报名开启 (提前 %.2fs 开火)..." % LEAD)
+            P("[..] 等待报名开启 (提前 %.2fs 开火)..." % lead_sec)
             last_refresh = time.time()
-            while srv_now(off) < target - LEAD:
+            while srv_now(off) < target - lead_sec:
                 if cancel_check and cancel_check():
                     P("[i] 目标已被取消, 退出等待。")
                     return _ret(False, "cancelled")
-                remain = target - LEAD - srv_now(off)
+                remain = target - lead_sec - srv_now(off)
                 time.sleep(min(remain, 0.5) if remain > 0.5 else max(remain, 0))
                 gap = 1 if remain < 10 else (2 if remain < 30 else 5)
                 if remain < 30 and time.time() - last_refresh > gap:
@@ -406,15 +420,15 @@ class TongjiClient:
             P("[!] 未拿到 TimeSigningUp, 立即开火 (适合已开放/手动触发场景)。")
             fire_start = srv_now(off)
 
-        deadline = fire_start + GRAB_DEADLINE
-        P("\n>>> 开火! 窗口 %ds, 每轮 %d 发, 间隔 %.2fs <<<" % (GRAB_DEADLINE, BURST, VOLLEY_INTERVAL))
+        deadline = fire_start + deadline_win
+        P("\n>>> 开火! 窗口 %ds, 每轮 %d 发, 间隔 %.2fs <<<" % (int(deadline_win), burst_n, v_interval))
         volley = 0
         seen_msgs = {}
         success = False
         submitted = False
         stop_reason = None
         volley_timeout = min(0.8, TIMEOUT)
-        ex = ThreadPoolExecutor(max_workers=BURST * 2)
+        ex = ThreadPoolExecutor(max_workers=max(2, burst_n * 2))
         try:
             while srv_now(off) < deadline and not success and not submitted:
                 if cancel_check and cancel_check():
@@ -431,11 +445,11 @@ class TongjiClient:
                             return _ret(False, "cookie_dead")
                         if volley % 5 == 1:
                             P("  第%d轮 仍无code(msg=%s) 剩余%.1fs" % (volley, m, deadline - srv_now(off)))
-                        time.sleep(VOLLEY_INTERVAL)
+                        time.sleep(v_interval)
                         continue
                     P("[✓] 开火时刻取到 code=%s, 开始猛攻报名!" % code)
 
-                futs = [ex.submit(self.api_signup, code) for _ in range(BURST)]
+                futs = [ex.submit(self.api_signup, code) for _ in range(burst_n)]
                 try:
                     for f in as_completed(futs, timeout=volley_timeout):
                         try:
@@ -476,7 +490,7 @@ class TongjiClient:
                     nc, _ = self._acquire_code(data_id)
                     if nc:
                         code = nc
-                time.sleep(VOLLEY_INTERVAL)
+                time.sleep(v_interval)
         finally:
             try:
                 ex.shutdown(wait=False, cancel_futures=True)

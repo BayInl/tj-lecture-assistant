@@ -176,8 +176,10 @@
     </h2>
     <div class="row">
       <label class="chk"><input type="checkbox" id="mu-allow-reg"> 允许凭邀请码自助注册</label>
-      <input type="text" id="mu-invite" placeholder="邀请码（留空则无需邀请码）" style="max-width:220px">
-      <button onclick="saveMuSettings()">保存注册设置</button>
+      <input type="text" id="mu-invite" placeholder="邀请码（留空则无需邀请码）" style="max-width:200px">
+      <label class="chk"><input type="checkbox" id="mu-cofire" checked> 同场同出口协同节流（防单IP限流）</label>
+      <label class="chk"><input type="checkbox" id="mu-admin-prio" checked> 管理员优先满速</label>
+      <button onclick="saveMuSettings()">保存多用户策略</button>
     </div>
     <div class="row">
       <input type="text" id="mu-new-user" placeholder="新同门账号(字母数字)" style="max-width:180px">
@@ -409,25 +411,44 @@ async function loadAdminUsers(){
   const mu=r.multi_user||{};
   $('mu-allow-reg').checked=!!mu.allow_register;
   $('mu-invite').value=mu.invite_code||'';
+  $('mu-cofire').checked=mu.cofire_throttle!==false;
+  $('mu-admin-prio').checked=mu.admin_priority!==false;
   const rows=r.users||[];
-  $('admin-users-body').innerHTML='<table><thead><tr><th>账号</th><th>角色</th><th>状态</th><th>Cookie</th><th>学生</th><th>已抢/待抢</th><th>专属 API Token</th><th>操作</th></tr></thead><tbody>'
+  $('admin-users-body').innerHTML='<table><thead><tr><th>账号</th><th>角色</th><th>状态</th><th>Cookie</th><th>学生</th><th>已抢/待抢</th><th>出口代理 (mihomo)</th><th>专属 API Token</th><th>操作</th></tr></thead><tbody>'
     + rows.map(u=>{
       const ckTxt=u.cookie_valid===true?'<span class="tag t-on">有效</span>':(u.cookie_valid===false?'<span class="tag t-off">失效</span>':'<span class="tag">无</span>');
       const stTxt=u.disabled?'<span class="tag t-off">已禁用</span>':'<span class="tag t-on">启用</span>';
-      const ops=u.is_primary?'<span class="muted">主管理员</span>'
-        :('<button onclick="adminToggleUser(\''+htmlEsc(u.username)+'\')">'+(u.disabled?'启用':'禁用')+'</button> '
+      const pxVal=u.proxy_url||'';
+      const pxTxt=pxVal?('<span class="tag t-on">'+htmlEsc(pxVal)+'</span>'):'<span class="muted">直连</span>';
+      const pxBtn='<button onclick="adminSetProxy(\''+htmlEsc(u.username)+'\',\''+htmlEsc(pxVal)+'\')">设代理</button> ';
+      const ops=u.is_primary?(pxBtn+'<span class="muted">主管理员</span>')
+        :(pxBtn+'<button onclick="adminToggleUser(\''+htmlEsc(u.username)+'\')">'+(u.disabled?'启用':'禁用')+'</button> '
           +'<button onclick="adminRotateToken(\''+htmlEsc(u.username)+'\')">重置Token</button> '
           +'<button class="danger" onclick="adminDeleteUser(\''+htmlEsc(u.username)+'\')">删除</button>');
       return '<tr><td><b>'+htmlEsc(u.username)+'</b></td><td>'+htmlEsc(u.role)+'</td><td>'+stTxt+'</td><td>'+ckTxt+'</td>'
         +'<td class="muted">'+htmlEsc(u.student||'-')+'</td>'
         +'<td>'+u.won_count+' / '+u.candidates_count+'</td>'
+        +'<td>'+pxTxt+'</td>'
         +'<td style="font-family:ui-monospace,monospace;font-size:11px">'+htmlEsc(u.api_token||'-')+'</td>'
         +'<td>'+ops+'</td></tr>';
     }).join('') + '</tbody></table>';
 }
 async function saveMuSettings(){
-  const r=await jpost('/api/admin/users',{action:'settings',allow_register:$('mu-allow-reg').checked,invite_code:$('mu-invite').value.trim()});
-  toast(r.ok?'✅ 已保存多用户注册设置':'保存失败');
+  const r=await jpost('/api/admin/users',{
+    action:'settings',
+    allow_register:$('mu-allow-reg').checked,
+    invite_code:$('mu-invite').value.trim(),
+    cofire_throttle:$('mu-cofire').checked,
+    admin_priority:$('mu-admin-prio').checked,
+  });
+  toast(r.ok?'✅ 已保存多用户策略与注册设置':'保存失败');
+}
+async function adminSetProxy(username, curProxy){
+  const v=prompt('设置 '+username+' 的 mihomo 出口代理地址（留空则直连，各用各的端口即互不共用出口IP）\n例如: http://127.0.0.1:7891', curProxy||'');
+  if(v===null) return;
+  const r=await jpost('/api/admin/users',{action:'set_proxy',username,proxy_url:v.trim()});
+  if(r.ok){ toast('✅ 已更新 '+username+' 出口: '+(r.proxy_url||'直连')); loadAdminUsers(); }
+  else toast('❌ '+(r.msg||'设置失败'));
 }
 async function adminCreateUser(){
   const username=$('mu-new-user').value.trim(), password=$('mu-new-pass').value;

@@ -102,6 +102,63 @@ class MultiUserServerTest(unittest.TestCase):
         self.assertEqual(cli_anon.get("/api/status", headers={"X-API-Token": bob_tok}).status_code, 401)
         self.assertEqual(cli_bob.get("/api/status").status_code, 401)
 
+    def test_cofire_throttle_admin_priority_and_per_user_proxy(self):
+        cli_admin = self.app.test_client()
+        self.assertEqual(cli_admin.post("/api/login", json={"username": "admin", "password": "adminpass123"}).status_code, 200)
+
+        for uname, pw in (("stu1", "stupass1"), ("stu2", "stupass2")):
+            r = cli_admin.post("/api/admin/users", json={"action": "create", "username": uname, "password": pw})
+            if r.status_code != 200:
+                self.assertIn("存在", str(r.get_json()))
+
+        # Invalid proxy rejected; subuser forbidden from changing proxy
+        self.assertEqual(
+            cli_admin.post("/api/admin/users", json={"action": "set_proxy", "username": "stu1", "proxy_url": "ftp://1.2.3.4:21"}).status_code,
+            400,
+        )
+
+        # Arm all 3 users on same lecture with shared direct exit ("")
+        did = "LECTURE-COFIRE-1"
+        rt_admin = srv.USER_RUNTIMES["admin"]
+        rt_s1 = srv.USER_RUNTIMES["stu1"]
+        rt_s2 = srv.USER_RUNTIMES["stu2"]
+        for rt in (rt_admin, rt_s1, rt_s2):
+            rt.set_proxy("")
+            with rt.lock:
+                rt.state["engine"]["locked"][did] = {"title": "Test", "lvl": "校级", "tgt": 1e12, "status": "grabbing", "auto": True}
+
+        p_admin = srv._plan_grab_profile(rt_admin, did, 0.0)
+        p_s1 = srv._plan_grab_profile(rt_s1, did, 0.0)
+        p_s2 = srv._plan_grab_profile(rt_s2, did, 0.0)
+
+        # Shared IP: admin keeps full burst & earlier lead; subusers are throttled and staggered
+        self.assertEqual(p_admin["peers"], 3)
+        self.assertEqual(p_admin["burst"], g.BURST)
+        self.assertAlmostEqual(p_admin["volley_interval"], g.VOLLEY_INTERVAL, places=2)
+        self.assertEqual(p_s1["burst"], 1)
+        self.assertEqual(p_s2["burst"], 1)
+        self.assertGreater(p_s1["volley_interval"], p_admin["volley_interval"])
+        self.assertGreater(p_admin["lead"], p_s1["lead"])
+        self.assertGreater(p_s1["lead"], p_s2["lead"])
+
+        # Assign distinct mihomo exit proxies to stu1 & stu2 -> zero shared IP contention -> all 3 unthrottled!
+        r_px1 = cli_admin.post("/api/admin/users", json={"action": "set_proxy", "username": "stu1", "proxy_url": "http://127.0.0.1:7891"})
+        r_px2 = cli_admin.post("/api/admin/users", json={"action": "set_proxy", "username": "stu2", "proxy_url": "http://127.0.0.1:7892"})
+        self.assertEqual(r_px1.status_code, 200)
+        self.assertEqual(r_px2.status_code, 200)
+        self.assertEqual(rt_s1.client._session.proxies.get("https"), "http://127.0.0.1:7891")
+        self.assertEqual(rt_s2.client._session.proxies.get("https"), "http://127.0.0.1:7892")
+        self.assertEqual(rt_admin.client._session.proxies, {})
+
+        self.assertEqual(srv._plan_grab_profile(rt_admin, did, 0.0)["burst"], g.BURST)
+        self.assertEqual(srv._plan_grab_profile(rt_s1, did, 0.0)["burst"], g.BURST)
+        self.assertEqual(srv._plan_grab_profile(rt_s2, did, 0.0)["burst"], g.BURST)
+
+        # Clean up synthetic lock entries
+        for rt in (rt_admin, rt_s1, rt_s2):
+            with rt.lock:
+                rt.state["engine"]["locked"].pop(did, None)
+
 
 if __name__ == "__main__":
     unittest.main()

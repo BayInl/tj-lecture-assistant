@@ -22,6 +22,7 @@ import threading
 import collections
 import datetime as dt
 import subprocess
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
 try:
@@ -67,10 +68,13 @@ DEFAULT_CFG = {
         "session_ttl_sec": 604800,
         "session_version": 1,
         "api_token": "",
+        "proxy_url": "",
     },
     "multi_user": {
         "allow_register": False,
         "invite_code": "",
+        "cofire_throttle": True,
+        "admin_priority": True,
     },
     "keepalive_sec": 300,
     "grab": {"xiao_watch": True, "xiao_auto": False, "xiao_campus": "",
@@ -412,6 +416,7 @@ class UserRuntime:
         self._cfg_store = _ROOT_CFG_STORE if is_primary else _CachedJsonConfig(self.cfg_path)
         self.lock = threading.RLock()
         self.client = g.TongjiClient(pool_connections=8, pool_maxsize=32)
+        self.proxy_url = ""
         self.logs = LogBuf(maxlen=1500)
         self.state = {
             "started_at": nowstr(),
@@ -438,6 +443,11 @@ class UserRuntime:
 
     def save_cfg(self, c):
         self._cfg_store.save(c)
+
+    def set_proxy(self, proxy_url=""):
+        p = str(proxy_url or "").strip()
+        self.proxy_url = p
+        self.client.set_proxy(p)
 
     def push(self, event, text, at_all=False):
         with self.lock:
@@ -805,14 +815,19 @@ class UserRuntime:
                 vv = self.state["engine"]["locked"].get(did)
                 return vv is None or vv.get("status") not in ("waiting", "grabbing")
 
+        prof = _register_and_plan_grab(self, did, off)
+        self.log("%s%s" % (tag, prof["note"]))
         try:
             ok, reason = self.client.grab_one(
                 did, off, force=force, tag=tag, cancel_check=_cancelled,
                 return_reason=True, log_fn=self.log,
+                burst=prof["burst"], volley_interval=prof["volley_interval"], lead=prof["lead"],
             )
         except Exception as e:
             self.log("%s抢报异常: %s" % (tag, e))
             reason = "full_or_timeout"
+        finally:
+            _unregister_active_grab(self.username, did)
 
         hard_retry = False
         soft_retry = False
@@ -1107,11 +1122,142 @@ class UserRuntime:
 USERS_LOCK = threading.RLock()
 USER_RUNTIMES = {}      # username -> UserRuntime
 USERS_META = {}         # username -> record in users.json (non-primary users)
+_ACTIVE_GRABS_LOCK = threading.Lock()
+_ACTIVE_GRABS = set()   # (username, did) 目前正处于 grab_wrapper 执行中的并发抢报
 
 SESSION_COOKIE_NAME = "tj_session"
 PBKDF2_ITERS = 260000
 _REVOKED_JTIS = {}
 _REVOKED_LOCK = threading.Lock()
+
+
+def _normalize_proxy_url(raw):
+    s = str(raw or "").strip()
+    if not s:
+        return True, ""
+    try:
+        u = urlparse(s)
+    except Exception:
+        return False, "代理地址格式无效"
+    scheme = (u.scheme or "").lower()
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        return False, "仅支持 http:// / https:// / socks5:// / socks5h:// 代理 (mihomo 推荐 http://127.0.0.1:端口)"
+    if not u.hostname or not u.port:
+        return False, "代理地址缺少主机或端口 (例如 http://127.0.0.1:7891)"
+    if scheme.startswith("socks"):
+        try:
+            import socks  # noqa: F401
+        except ImportError:
+            return False, "当前环境未安装 PySocks，无法使用 socks5；请改填 mihomo HTTP/Mixed 端口 (如 http://127.0.0.1:7891)"
+    return True, s
+
+
+def _rt_prearm_window(rt):
+    cfg = rt.load_cfg(readonly=True)
+    grab = cfg.get("grab") or {}
+    interval = int(grab.get("interval_sec", 30) or 30)
+    xiao_auto = bool(grab.get("xiao_auto", False))
+    yuan_auto = bool(grab.get("yuan_auto", True))
+    auto_levels = set()
+    if grab.get("xiao_watch", True) and xiao_auto:
+        auto_levels.add("校级")
+    if grab.get("yuan_watch", True) and yuan_auto:
+        auto_levels.add("院级")
+    return auto_levels, max(45, interval + 15) + 5
+
+
+def _shared_exit_peers_for_did(u, did, off):
+    exit_key = (u.proxy_url or "").strip()
+    now = g.srv_now(off)
+    with _ACTIVE_GRABS_LOCK:
+        active_snap = set(_ACTIVE_GRABS)
+    peers = []
+    seen = set()
+    for rt in _all_runtimes():
+        if (rt.proxy_url or "").strip() != exit_key:
+            continue
+        matched = (rt.username == u.username) or ((rt.username, did) in active_snap)
+        if not matched:
+            auto_levels, prearm = _rt_prearm_window(rt)
+            with rt.lock:
+                v = rt.state["engine"]["locked"].get(did)
+                if v:
+                    st = v.get("status", "waiting")
+                    if st == "grabbing":
+                        matched = True
+                    elif st == "waiting":
+                        will_fire = bool(v.get("auto")) or (not v.get("manual") and v.get("lvl") in auto_levels)
+                        tgt = v.get("tgt") or now
+                        if will_fire and (tgt - now) <= prearm:
+                            matched = True
+        if matched and rt.username not in seen:
+            seen.add(rt.username)
+            peers.append(rt)
+    return peers
+
+
+def _plan_grab_profile(u, did, off):
+    root_cfg = load_cfg(readonly=True)
+    mu = root_cfg.get("multi_user") or {}
+    throttle_on = mu.get("cofire_throttle", True)
+    admin_prio = mu.get("admin_priority", True)
+    exit_key = (u.proxy_url or "").strip()
+    peers = _shared_exit_peers_for_did(u, did, off)
+    n_peers = len(peers)
+
+    if (not throttle_on) or n_peers <= 1:
+        route = ("代理 %s" % exit_key) if exit_key else "直连"
+        return {
+            "burst": g.BURST,
+            "volley_interval": g.VOLLEY_INTERVAL,
+            "lead": g.LEAD,
+            "peers": n_peers,
+            "note": "[并发策略] %s · 独享出口满速 burst=%d interval=%.2fs lead=%.2fs" % (
+                route, g.BURST, g.VOLLEY_INTERVAL, g.LEAD),
+        }
+
+    is_admin = bool(u.role == "admin" or u.is_primary)
+    route = exit_key or "直连"
+    if admin_prio and is_admin:
+        burst = g.BURST if n_peers <= 3 else max(3, g.BURST - 1)
+        interval = g.VOLLEY_INTERVAL
+        lead = max(g.LEAD, 0.44)
+        return {
+            "burst": burst,
+            "volley_interval": interval,
+            "lead": lead,
+            "peers": n_peers,
+            "note": "[协同流控] 同出口(%s)共%d人抢此场: 管理员优先满速 burst=%d interval=%.2fs lead=%.2fs" % (
+                route, n_peers, burst, interval, lead),
+        }
+
+    throttled_peers = sorted(
+        p.username for p in peers
+        if not (admin_prio and (p.role == "admin" or p.is_primary))
+    )
+    idx = throttled_peers.index(u.username) if u.username in throttled_peers else 0
+    burst = 2 if n_peers == 2 else 1
+    interval = round(min(0.45, 0.16 + 0.08 * (n_peers - 1)), 2)
+    lead = round(max(0.05, 0.30 - 0.12 * (idx + 1)), 2)
+    return {
+        "burst": burst,
+        "volley_interval": interval,
+        "lead": lead,
+        "peers": n_peers,
+        "note": "[协同流控] 同出口(%s)共%d人抢此场: 错峰节流(#%d) burst=%d interval=%.2fs lead=%.2fs%s" % (
+            route, n_peers, idx + 1, burst, interval, lead, " [管理员优先]" if admin_prio else ""),
+    }
+
+
+def _register_and_plan_grab(u, did, off):
+    with _ACTIVE_GRABS_LOCK:
+        _ACTIVE_GRABS.add((u.username, did))
+    return _plan_grab_profile(u, did, off)
+
+
+def _unregister_active_grab(username, did):
+    with _ACTIVE_GRABS_LOCK:
+        _ACTIVE_GRABS.discard((username, did))
 
 
 def _hash_password(password, salt_bytes=None):
@@ -1176,6 +1322,7 @@ def _init_all_users():
         USERS_META.clear()
         USER_RUNTIMES.clear()
         rt_prim = UserRuntime(prim, role="admin", is_primary=True, data_dir=DATA_DIR)
+        rt_prim.set_proxy((cfg.get("auth") or {}).get("proxy_url", ""))
         rt_prim.boot()
         USER_RUNTIMES[prim] = rt_prim
         for uname, rec in raw_users.items():
@@ -1184,6 +1331,7 @@ def _init_all_users():
             USERS_META[uname] = rec
             if not rec.get("disabled"):
                 rt = UserRuntime(uname, role="user", is_primary=False)
+                rt.set_proxy(rec.get("proxy_url", ""))
                 rt.boot()
                 USER_RUNTIMES[uname] = rt
 
@@ -1199,6 +1347,7 @@ def _get_user_auth_record(username, root_cfg):
             "password_hash": auth.get("password_hash", ""),
             "role": "admin",
             "api_token": auth.get("api_token", ""),
+            "proxy_url": auth.get("proxy_url", ""),
             "session_version": int(auth.get("session_version", 1) or 1),
             "disabled": False,
             "is_primary": True,
@@ -1522,10 +1671,15 @@ def engine_loop():
             if u.client.cookie:
                 if ui < min_interval:
                     min_interval = ui
-                # 优先选择当前有效或未明确失效的账号扫描全校列表
+                # 优先选择当前有效、主管理员且直连的账号扫描全校列表
                 with u.lock:
                     v = u.state["cookie"].get("valid")
-                scanners.append((0 if v is True else (1 if v is None else 2), u))
+                scanners.append((
+                    0 if v is True else (1 if v is None else 2),
+                    0 if u.is_primary else 1,
+                    0 if not u.proxy_url else 1,
+                    u,
+                ))
 
         with GLOBAL_LOCK:
             GLOBAL_STATE["round"] = rnd
@@ -1536,9 +1690,9 @@ def engine_loop():
             _sleep(min(min_interval, 10))
             continue
 
-        scanners.sort(key=lambda pair: pair[0])
+        scanners.sort(key=lambda item: item[:3])
         if rnd % 10 == 0:
-            for _, su in scanners:
+            for *_, su in scanners:
                 try:
                     off = su.client.server_offset(samples=3)
                     with GLOBAL_LOCK:
@@ -1549,7 +1703,7 @@ def engine_loop():
 
         uniq = None
         used_scanner = None
-        for _, su in scanners:
+        for *_, su in scanners:
             try:
                 st, msg, rows = su.client.scan_lectures_ex(statuses=(0,), max_pages=3, page_size=50, stop_when_ended=True)
             except Exception as e:
@@ -1759,7 +1913,7 @@ def api_status():
         ]
         st = {
             "started_at": u.state["started_at"],
-            "user": {"username": u.username, "role": u.role},
+            "user": {"username": u.username, "role": u.role, "proxy_enabled": bool(u.proxy_url)},
             "cookie": {
                 "present": ck.get("present", False),
                 "session_id": ck.get("session_id", ""),
@@ -2137,6 +2291,7 @@ def api_admin_users():
                     "is_primary": bool(rec.get("is_primary")),
                     "disabled": bool(rec.get("disabled")),
                     "api_token": rec.get("api_token", ""),
+                    "proxy_url": rec.get("proxy_url", ""),
                     "cookie_valid": ck_valid,
                     "student": stu_nm,
                     "won_count": won_cnt,
@@ -2150,6 +2305,8 @@ def api_admin_users():
             "multi_user": {
                 "allow_register": bool(mu.get("allow_register", False)),
                 "invite_code": str(mu.get("invite_code") or ""),
+                "cofire_throttle": bool(mu.get("cofire_throttle", True)),
+                "admin_priority": bool(mu.get("admin_priority", True)),
             },
         })
 
@@ -2161,6 +2318,10 @@ def api_admin_users():
             mu["allow_register"] = bool(data["allow_register"])
         if "invite_code" in data:
             mu["invite_code"] = str(data["invite_code"] or "").strip()
+        if "cofire_throttle" in data:
+            mu["cofire_throttle"] = bool(data["cofire_throttle"])
+        if "admin_priority" in data:
+            mu["admin_priority"] = bool(data["admin_priority"])
         save_cfg(root_cfg)
         return jsonify({"ok": True})
     if act == "create":
@@ -2171,6 +2332,33 @@ def api_admin_users():
 
     target = str(data.get("username") or "").strip()
     prim = _primary_username(root_cfg) or "admin"
+    if act == "set_proxy":
+        ok_p, clean_p = _normalize_proxy_url(data.get("proxy_url", ""))
+        if not ok_p:
+            return jsonify({"ok": False, "msg": clean_p}), 400
+        if not target:
+            return jsonify({"ok": False, "msg": "缺少用户名"}), 400
+        if target == prim:
+            root_cfg.setdefault("auth", {})["proxy_url"] = clean_p
+            save_cfg(root_cfg)
+            with USERS_LOCK:
+                rt = USER_RUNTIMES.get(prim)
+            if rt is not None:
+                rt.set_proxy(clean_p)
+                rt.log("[proxy] 已更新主管理员出口代理: %s" % (clean_p or "直连"))
+            return jsonify({"ok": True, "proxy_url": clean_p})
+        with USERS_LOCK:
+            rec = USERS_META.get(target)
+            if not rec:
+                return jsonify({"ok": False, "msg": "用户不存在"}), 404
+            rec["proxy_url"] = clean_p
+            _save_users_meta()
+            rt = USER_RUNTIMES.get(target)
+        if rt is not None:
+            rt.set_proxy(clean_p)
+            rt.log("[proxy] 管理员已更新出口代理: %s" % (clean_p or "直连"))
+        return jsonify({"ok": True, "proxy_url": clean_p})
+
     if not target or target == prim:
         return jsonify({"ok": False, "msg": "不能通过多用户面板修改主管理员"}), 400
 
@@ -2184,6 +2372,7 @@ def api_admin_users():
                 USER_RUNTIMES.pop(target, None)
             else:
                 rt = UserRuntime(target, role="user", is_primary=False)
+                rt.set_proxy(rec.get("proxy_url", ""))
                 rt.boot()
                 USER_RUNTIMES[target] = rt
             _save_users_meta()
