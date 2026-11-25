@@ -38,6 +38,9 @@ type proxySnapshot struct {
 	HTTPSEnabled bool
 	HTTPSServer  string
 	HTTPSPort    string
+	SOCKSEnabled bool
+	SOCKSServer  string
+	SOCKSPort    string
 }
 
 func findMitmdump(projDir string) string {

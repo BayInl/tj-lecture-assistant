@@ -57,6 +57,7 @@ func readProxyFlag(svc, flag string) (bool, string, string) {
 func getSystemProxy(svc string) proxySnapshot {
 	hEn, hSrv, hPort := readProxyFlag(svc, "-getwebproxy")
 	sEn, sSrv, sPort := readProxyFlag(svc, "-getsecurewebproxy")
+	kEn, kSrv, kPort := readProxyFlag(svc, "-getsocksfirewallproxy")
 	return proxySnapshot{
 		HTTPEnabled:  hEn,
 		HTTPServer:   hSrv,
@@ -64,6 +65,9 @@ func getSystemProxy(svc string) proxySnapshot {
 		HTTPSEnabled: sEn,
 		HTTPSServer:  sSrv,
 		HTTPSPort:    sPort,
+		SOCKSEnabled: kEn,
+		SOCKSServer:  kSrv,
+		SOCKSPort:    kPort,
 	}
 }
 
@@ -75,6 +79,8 @@ func setSystemProxy(svc, host string, port int) error {
 	if err := exec.Command("networksetup", "-setsecurewebproxy", svc, host, p).Run(); err != nil {
 		return err
 	}
+	// Temporarily disable SOCKS proxy during capture so WeChat/XWeb routes cleanly through mitmdump HTTP/HTTPS.
+	_ = exec.Command("networksetup", "-setsocksfirewallproxystate", svc, "off").Run()
 	_ = exec.Command("networksetup", "-setwebproxystate", svc, "on").Run()
 	_ = exec.Command("networksetup", "-setsecurewebproxystate", svc, "on").Run()
 	return nil
@@ -92,5 +98,11 @@ func restoreSystemProxy(svc string, snap proxySnapshot) {
 		_ = exec.Command("networksetup", "-setsecurewebproxystate", svc, "on").Run()
 	} else {
 		_ = exec.Command("networksetup", "-setsecurewebproxystate", svc, "off").Run()
+	}
+	if snap.SOCKSEnabled && snap.SOCKSServer != "" && snap.SOCKSPort != "" {
+		_ = exec.Command("networksetup", "-setsocksfirewallproxy", svc, snap.SOCKSServer, snap.SOCKSPort).Run()
+		_ = exec.Command("networksetup", "-setsocksfirewallproxystate", svc, "on").Run()
+	} else {
+		_ = exec.Command("networksetup", "-setsocksfirewallproxystate", svc, "off").Run()
 	}
 }
