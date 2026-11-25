@@ -320,7 +320,11 @@ async function refreshLogs(){
 async function saveConfig(){
   const kw=$('g-kw').value.split(/[,，]/).map(s=>s.trim()).filter(Boolean);
   const dev=[]; if($('d-ev-success').checked)dev.push('success'); if($('d-ev-cookie').checked)dev.push('cookie_dead'); if($('d-ev-new').checked)dev.push('new_target'); if($('d-ev-fail').checked)dev.push('grab_fail');
-  const body={grab:{xiao_watch:$('g-xiao-watch').checked,xiao_auto:$('g-xiao-auto').checked,xiao_campus:$('g-xiao-campus').value,yuan_watch:$('g-yuan-watch').checked,yuan_auto:$('g-yuan-auto').checked,yuan_college_only:$('g-college').checked,yuan_campus:$('g-yuan-campus').value,force:$('g-force').checked,keywords:kw,interval_sec:parseInt($('g-interval').value)||30},keepalive_sec:parseInt($('g-ka').value)||300,dingtalk:{webhook:$('d-webhook').value.trim(),secret:$('d-secret').value.trim(),prefix:$('d-prefix').value,notify_events:dev}};
+  const body={
+    grab:{xiao_watch:$('g-xiao-watch').checked,xiao_auto:$('g-xiao-auto').checked,xiao_campus:$('g-xiao-campus').value,yuan_watch:$('g-yuan-watch').checked,yuan_auto:$('g-yuan-auto').checked,yuan_college_only:$('g-college').checked,yuan_campus:$('g-yuan-campus').value,force:$('g-force').checked,keywords:kw,interval_sec:parseInt($('g-interval').value)||30},
+    keepalive_sec:parseInt($('g-ka').value)||300,
+    dingtalk:{webhook:$('d-webhook').value.trim(),secret:$('d-secret').value.trim(),prefix:$('d-prefix').value,notify_events:dev},
+  };
   const r=await jpost('/api/config',body);
   if(r.ok){ toast('✅ 配置已保存并即时生效'); cfgLoaded=false; refreshStatus(); } else toast('保存失败');
 }

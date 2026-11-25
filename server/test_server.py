@@ -16,6 +16,7 @@ if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
 import lecture_grabber as g
+import dida365 as dida_mod
 import server_app as srv
 
 
@@ -158,6 +159,54 @@ class MultiUserServerTest(unittest.TestCase):
         for rt in (rt_admin, rt_s1, rt_s2):
             with rt.lock:
                 rt.state["engine"]["locked"].pop(did, None)
+
+    def test_dida365_time_parsing_and_idempotent_sync(self):
+        s1, e1 = dida_mod.parse_lecture_time_range("2026-12-01 14:00~16:30")
+        self.assertEqual(s1, "2026-12-01T14:00:00+0800")
+        self.assertEqual(e1, "2026-12-01T16:30:00+0800")
+
+        s2, e2 = dida_mod.parse_lecture_time_range("2026-12-01 19:00")
+        self.assertEqual(s2, "2026-12-01T19:00:00+0800")
+        self.assertEqual(e2, "2026-12-01T21:00:00+0800")
+
+        cli_admin = self.app.test_client()
+        self.assertEqual(cli_admin.post("/api/login", json={"username": "admin", "password": "adminpass123"}).status_code, 200)
+        r_cfg = cli_admin.post("/api/config", json={"dida365": {"enabled": True, "token": "dp_test_token", "project_name": "🎓 同济讲座", "remind_before_min": 45}})
+        self.assertEqual(r_cfg.status_code, 200)
+        self.assertEqual(r_cfg.get_json()["cfg"]["dida365"]["remind_before_min"], 45)
+
+        rt = srv.USER_RUNTIMES["admin"]
+        with rt.lock:
+            rt.state["engine"]["won"] = [
+                {"did": "DIDA-UPCOMING-1", "title": "未来测试讲座", "lvl": "校级", "ltime": "2099-12-01 14:00~16:00", "won_at": "2026-11-25 18:00:00"},
+                {"did": "DIDA-PAST-1", "title": "过期测试讲座", "lvl": "校级", "ltime": "2020-01-01 14:00~16:00", "won_at": "2020-01-01 10:00:00"},
+            ]
+
+        created_calls = []
+        orig_ensure = dida_mod.ensure_project
+        orig_create = dida_mod.create_lecture_task
+        try:
+            dida_mod.ensure_project = lambda tok, project_name="", project_id="": (True, "ok", "proj-123", project_name or "🎓 同济讲座")
+            def _fake_create(tok, pid, lec, remind_before_min=60):
+                created_calls.append((pid, lec["did"], remind_before_min))
+                return True, "ok", "task-xyz-1"
+            dida_mod.create_lecture_task = _fake_create
+
+            r1 = cli_admin.post("/api/dida/sync").get_json()
+            self.assertTrue(r1["ok"])
+            self.assertEqual(r1["synced"], 1)
+            self.assertEqual(r1["skipped"], 1)
+            self.assertEqual(created_calls, [("proj-123", "DIDA-UPCOMING-1", 45)])
+
+            # Second sync must be idempotent (0 new tasks)
+            r2 = cli_admin.post("/api/dida/sync").get_json()
+            self.assertEqual(r2["synced"], 0)
+            self.assertEqual(r2["skipped"], 2)
+        finally:
+            dida_mod.ensure_project = orig_ensure
+            dida_mod.create_lecture_task = orig_create
+            with rt.lock:
+                rt.state["engine"]["won"] = []
 
 
 if __name__ == "__main__":

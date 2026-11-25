@@ -11,6 +11,16 @@ import (
 	"time"
 )
 
+// Dida365Config mirrors the server's per-user dida365 configuration.
+type Dida365Config struct {
+	Enabled         bool   `json:"enabled"`
+	Token           string `json:"token"`
+	ProjectName     string `json:"project_name"`
+	SyncOnWin       bool   `json:"sync_on_win"`
+	DeleteOnCancel  bool   `json:"delete_on_cancel"`
+	RemindBeforeMin int    `json:"remind_before_min"`
+}
+
 // ServerStatus mirrors the JSON payload of GET /api/status.
 type ServerStatus struct {
 	Now  string `json:"now"`
@@ -44,12 +54,13 @@ type ServerStatus struct {
 	Events []ServerEvent `json:"events"`
 	Cfg    struct {
 		Grab struct {
-			XiaoWatch bool   `json:"xiao_watch"`
-			XiaoAuto  bool   `json:"xiao_auto"`
-			YuanWatch bool   `json:"yuan_watch"`
-			YuanAuto  bool   `json:"yuan_auto"`
+			XiaoWatch  bool   `json:"xiao_watch"`
+			XiaoAuto   bool   `json:"xiao_auto"`
+			YuanWatch  bool   `json:"yuan_watch"`
+			YuanAuto   bool   `json:"yuan_auto"`
 			YuanCampus string `json:"yuan_campus"`
 		} `json:"grab"`
+		Dida365 Dida365Config `json:"dida365"`
 	} `json:"cfg"`
 }
 
@@ -238,4 +249,50 @@ func (c *apiClient) LoginAndFetchToken(serverURL, username, password string) (st
 		return "", fmt.Errorf("%s", nonEmpty(accRes.Msg, "获取 API Token 失败"))
 	}
 	return accRes.APIToken, nil
+}
+
+func (c *apiClient) SaveDidaConfig(cfg ClientConfig, d Dida365Config) error {
+	var res struct {
+		OK  bool   `json:"ok"`
+		Msg string `json:"msg"`
+	}
+	if err := c.doJSON(cfg, http.MethodPost, "/api/config", map[string]any{"dida365": d}, &res); err != nil {
+		return err
+	}
+	if !res.OK {
+		return fmt.Errorf("%s", nonEmpty(res.Msg, "保存滴答清单配置失败"))
+	}
+	return nil
+}
+
+func (c *apiClient) TestDida(cfg ClientConfig, token string) (string, error) {
+	var res struct {
+		OK  bool   `json:"ok"`
+		Msg string `json:"msg"`
+	}
+	body := map[string]any{}
+	if strings.TrimSpace(token) != "" {
+		body["token"] = strings.TrimSpace(token)
+	}
+	if err := c.doJSON(cfg, http.MethodPost, "/api/dida/test", body, &res); err != nil {
+		return "", err
+	}
+	if !res.OK {
+		return "", fmt.Errorf("%s", nonEmpty(res.Msg, "连接失败"))
+	}
+	return nonEmpty(res.Msg, "连接成功"), nil
+}
+
+func (c *apiClient) SyncDida(cfg ClientConfig) (string, error) {
+	var res struct {
+		OK  bool   `json:"ok"`
+		Msg string `json:"msg"`
+	}
+	if err := c.doJSON(cfg, http.MethodPost, "/api/dida/sync", map[string]any{}, &res); err != nil {
+		return "", err
+	}
+	if !res.OK {
+		return "", fmt.Errorf("%s", nonEmpty(res.Msg, "同步失败"))
+	}
+	return nonEmpty(res.Msg, "同步完成"), nil
 }

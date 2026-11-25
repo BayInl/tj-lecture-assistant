@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"log"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +56,17 @@ type lectureApp struct {
 	draftLogin     bool
 	settingsMsg    string
 
+	// Dida365 mobile schedule sync drafts (backed by server per-user config)
+	draftDidaLoaded    bool
+	draftDidaEnabled   bool
+	draftDidaToken     string
+	draftDidaProject   string
+	draftDidaRemind    string
+	draftDidaSyncWin   bool
+	draftDidaDelCancel bool
+	didaBusy           bool
+	didaMsg            string
+
 	// Notification deduplication & idle power optimization
 	initialized        bool
 	lastValid          *bool
@@ -82,9 +94,13 @@ func newLectureApp() *lectureApp {
 		draftOCRList:  strings.Join(cfg.OCRTargets, ", "),
 		draftURL:      cfg.ServerURL,
 		draftToken:    cfg.APIToken,
-		draftProj:     cfg.ProjectDir,
-		draftAutoCU:   cfg.AutoRegrabOnDead,
-		seenEvents:    map[string]struct{}{},
+		draftProj:          cfg.ProjectDir,
+		draftAutoCU:        cfg.AutoRegrabOnDead,
+		draftDidaProject:   "🎓 同济讲座",
+		draftDidaRemind:    "60",
+		draftDidaSyncWin:   true,
+		draftDidaDelCancel: true,
+		seenEvents:         map[string]struct{}{},
 		wakePollCh:    make(chan struct{}, 1),
 	}
 }
@@ -264,6 +280,18 @@ func (a *lectureApp) pollOnce() time.Duration {
 		a.lastErr = ""
 		a.lastSyncAt = nowStr
 		a.status = st
+		if !a.draftDidaLoaded {
+			a.draftDidaLoaded = true
+			dd := st.Cfg.Dida365
+			a.draftDidaEnabled = dd.Enabled
+			a.draftDidaToken = dd.Token
+			a.draftDidaProject = nonEmpty(strings.TrimSpace(dd.ProjectName), "🎓 同济讲座")
+			if dd.RemindBeforeMin > 0 || dd.Enabled {
+				a.draftDidaRemind = strconv.Itoa(dd.RemindBeforeMin)
+			}
+			a.draftDidaSyncWin = dd.SyncOnWin || !dd.Enabled
+			a.draftDidaDelCancel = dd.DeleteOnCancel || !dd.Enabled
+		}
 
 		// Detect transitions and new events for native macOS notifications
 		if !a.initialized {
@@ -926,6 +954,110 @@ func (a *lectureApp) settingsTab(c *ui.Context) {
 		})
 		if a.settingsMsg != "" {
 			ui.Text(c, a.settingsMsg).FontSize(12).TextColor(t.TextMuted)
+		}
+	})
+
+	ui.Column(c).Gap(8).Padding(12).Radius(t.Radius).Background(t.Surface).Border(1, t.Border).Children(func() {
+		didaOwner := "未连接服务器"
+		if a.connected && a.status.User.Username != "" {
+			didaOwner = "当前绑定服务器账号: " + a.status.User.Username + "（按专属 API Token 自动匹配，仅在客户端配置并同步至云端）"
+		}
+		ui.Text(c, "滴答清单同步（手机日程提醒）").FontSize(13).Bold()
+		ui.Text(c, didaOwner).FontSize(11).TextColor(t.TextMuted)
+		ui.Text(c, "在滴答清单网页版 → 设置 → 账号 → API 口令 生成 dp_... 口令，抢中讲座后自动建日程并同步到手机。").FontSize(11).TextColor(t.TextMuted)
+
+		ui.Row(c).AlignItems(ui.Center).Gap(10).Children(func() {
+			ui.Text(c, "启用滴答清单同步").FontSize(12).Grow(1)
+			ui.Switch(c, &a.draftDidaEnabled).Label("启用")
+		})
+		ui.Row(c).AlignItems(ui.Center).Gap(10).Children(func() {
+			ui.Text(c, "抢中自动建日程 / 退选自动删除").FontSize(12).Grow(1)
+			ui.Switch(c, &a.draftDidaSyncWin).Label("自动同步")
+			ui.Switch(c, &a.draftDidaDelCancel).Label("退选删除")
+		})
+
+		ui.Text(c, "API 口令 (Personal Token)").FontSize(11).TextColor(t.TextMuted)
+		ui.TextInput(c.Key("dd-token"), &a.draftDidaToken).Password().Placeholder("dp_...")
+
+		ui.Row(c).Gap(8).Children(func() {
+			ui.Column(c).Gap(4).Grow(2).Children(func() {
+				ui.Text(c, "目标清单名（无则自动创建）").FontSize(11).TextColor(t.TextMuted)
+				ui.TextInput(c.Key("dd-proj"), &a.draftDidaProject).Placeholder("🎓 同济讲座")
+			})
+			ui.Column(c).Gap(4).Grow(1).Children(func() {
+				ui.Text(c, "开讲前提醒(分钟)").FontSize(11).TextColor(t.TextMuted)
+				ui.TextInput(c.Key("dd-rem"), &a.draftDidaRemind).Placeholder("60")
+			})
+		})
+
+		ui.Row(c).Gap(8).Children(func() {
+			if ui.PrimaryButton(c, "保存滴答设置").Disabled(a.didaBusy).Clicked() {
+				rem, err := strconv.Atoi(strings.TrimSpace(a.draftDidaRemind))
+				if err != nil || rem < 0 {
+					rem = 60
+				}
+				dcfg := Dida365Config{
+					Enabled:         a.draftDidaEnabled,
+					Token:           strings.TrimSpace(a.draftDidaToken),
+					ProjectName:     nonEmpty(strings.TrimSpace(a.draftDidaProject), "🎓 同济讲座"),
+					SyncOnWin:       a.draftDidaSyncWin,
+					DeleteOnCancel:  a.draftDidaDelCancel,
+					RemindBeforeMin: rem,
+				}
+				cfgSnap := a.cfg
+				a.didaBusy = true
+				a.didaMsg = "正在保存滴答清单配置…"
+				go func() {
+					err := a.api.SaveDidaConfig(cfgSnap, dcfg)
+					a.applyUI(true, func() {
+						a.didaBusy = false
+						if err != nil {
+							a.didaMsg = "❌ 保存失败: " + err.Error()
+						} else {
+							a.didaMsg = "✅ 滴答清单配置已保存到服务器"
+						}
+					})
+					if err == nil {
+						a.triggerPoll()
+					}
+				}()
+			}
+			if ui.Button(c, "测试连接").Disabled(a.didaBusy).Clicked() {
+				cfgSnap := a.cfg
+				tok := strings.TrimSpace(a.draftDidaToken)
+				a.didaBusy = true
+				a.didaMsg = "正在测试滴答清单连接…"
+				go func() {
+					msg, err := a.api.TestDida(cfgSnap, tok)
+					a.applyUI(true, func() {
+						a.didaBusy = false
+						if err != nil {
+							a.didaMsg = "❌ " + err.Error()
+						} else {
+							a.didaMsg = "✅ " + msg
+						}
+					})
+				}()
+			}
+			if ui.Button(c, "同步未来讲座").Disabled(a.didaBusy).Clicked() {
+				cfgSnap := a.cfg
+				a.didaBusy = true
+				a.didaMsg = "正在同步未来已抢讲座…"
+				go func() {
+					msg, err := a.api.SyncDida(cfgSnap)
+					a.applyUI(true, func() {
+						a.didaBusy = false
+						if err != nil {
+							a.didaMsg = "❌ " + err.Error()
+						} else {
+							a.didaMsg = "✅ " + msg
+						}
+					})
+				}()
+			}
+		})
+		if a.didaMsg != "" {
+			ui.Text(c, a.didaMsg).FontSize(12).TextColor(t.TextMuted)
 		}
 	})
 }

@@ -36,6 +36,7 @@ if HERE not in sys.path:
 
 import lecture_grabber as g
 import notify as notify_mod
+import dida365 as dida_mod
 from flask import Flask, request, jsonify, Response, make_response, g as flask_g
 
 BUNDLE_DIR = getattr(sys, "_MEIPASS", HERE)
@@ -59,6 +60,15 @@ USERNAME_RE = re.compile(r"^[a-zA-Z0-9_-]{2,24}$")
 DEFAULT_CFG = {
     "dingtalk": {"webhook": "", "secret": "", "prefix": "【同济高等讲堂】",
                  "notify_events": ["success", "cookie_dead", "new_target", "grab_fail"]},
+    "dida365": {
+        "enabled": False,
+        "token": "",
+        "project_id": "",
+        "project_name": "🎓 同济讲座",
+        "sync_on_win": True,
+        "delete_on_cancel": True,
+        "remind_before_min": 60,
+    },
     "webui": {"host": "0.0.0.0", "port": 8848},
     "auth": {
         "enabled": True,
@@ -779,6 +789,119 @@ class UserRuntime:
             self.save_won()
             self.log("[提醒] 已发开讲提醒: 《%s》" % str(w.get("title"))[:30])
 
+    def sync_won_item_to_dida(self, did, force=False, allow_ended=False):
+        cfg = self.load_cfg(readonly=True)
+        dcfg = cfg.get("dida365") or {}
+        tok = str(dcfg.get("token") or "").strip()
+        if not (dcfg.get("enabled") and tok):
+            return False, "未启用滴答清单"
+        with self.lock:
+            item = None
+            for e in self.state["engine"].get("won", []):
+                if e.get("did") == did:
+                    item = dict(e)
+                    break
+        if not item:
+            return False, "未找到该已抢讲座"
+        if item.get("cancelled"):
+            return False, "已取消"
+        if (not allow_ended) and _lecture_ended(item, time.time()):
+            return False, "已结束"
+        if (not force) and item.get("dida_task_id"):
+            return True, "already_synced"
+
+        # 补充地点/主讲/校区信息
+        if self.client.cookie and not item.get("venue"):
+            try:
+                dd = (self.client.api_hall(did).get("data") or {})
+                if dd.get("Venue"):
+                    item["venue"] = str(dd.get("Venue") or "")
+                if dd.get("NameSpeaker"):
+                    item["speaker"] = str(dd.get("NameSpeaker") or "")
+                if dd.get("CampusName") and not item.get("campus"):
+                    item["campus"] = str(dd.get("CampusName") or "")
+            except Exception:
+                pass
+
+        pname = str(dcfg.get("project_name") or "🎓 同济讲座").strip() or "🎓 同济讲座"
+        pid = str(dcfg.get("project_id") or "").strip()
+        ok_p, msg_p, real_pid, real_pname = dida_mod.ensure_project(tok, project_name=pname, project_id=pid)
+        if not ok_p or not real_pid:
+            self.log("[滴答清单] 获取/创建清单失败: %s" % msg_p)
+            return False, msg_p
+        if real_pid != pid:
+            c2 = self.load_cfg()
+            c2.setdefault("dida365", {})["project_id"] = real_pid
+            c2["dida365"]["project_name"] = real_pname
+            self.save_cfg(c2)
+
+        ok_t, msg_t, tid = dida_mod.create_lecture_task(
+            tok, real_pid, item, remind_before_min=dcfg.get("remind_before_min", 60),
+        )
+        if not ok_t:
+            self.log("[滴答清单] 同步失败 《%s》: %s" % (str(item.get("title"))[:24], msg_t))
+            return False, msg_t
+
+        with self.lock:
+            for e in self.state["engine"].get("won", []):
+                if e.get("did") == did:
+                    e["dida_task_id"] = tid
+                    e["dida_project_id"] = real_pid
+                    if item.get("venue"):
+                        e["venue"] = item["venue"]
+                    if item.get("speaker"):
+                        e["speaker"] = item["speaker"]
+                    if item.get("campus"):
+                        e["campus"] = item["campus"]
+        self.save_won()
+        self.log("[滴答清单] ✅ 已同步到清单「%s」: 《%s》" % (real_pname, str(item.get("title"))[:28]))
+        return True, tid
+
+    def remove_cancelled_from_dida(self, w):
+        cfg = self.load_cfg(readonly=True)
+        dcfg = cfg.get("dida365") or {}
+        tok = str(dcfg.get("token") or "").strip()
+        tid = str(w.get("dida_task_id") or "").strip()
+        pid = str(w.get("dida_project_id") or dcfg.get("project_id") or "").strip()
+        if not (dcfg.get("enabled") and dcfg.get("delete_on_cancel", True) and tok and tid and pid):
+            return
+        ok, msg = dida_mod.delete_task(tok, pid, tid)
+        if ok:
+            self.log("[滴答清单] 已清理退选讲座任务: 《%s》" % str(w.get("title"))[:24])
+        else:
+            self.log("[滴答清单] 清理退选任务失败: %s" % msg)
+
+    def sync_all_upcoming_won_to_dida(self):
+        cfg = self.load_cfg(readonly=True)
+        dcfg = cfg.get("dida365") or {}
+        if not (dcfg.get("enabled") and str(dcfg.get("token") or "").strip()):
+            return {"ok": False, "msg": "请先填写滴答清单 API 口令并勾选启用后保存配置", "synced": 0, "skipped": 0, "failed": 0}
+        with self.lock:
+            won = [dict(w) for w in self.state["engine"].get("won", [])]
+        now_ts = time.time()
+        synced, skipped, failed = 0, 0, 0
+        last_err = ""
+        for w in won:
+            did = str(w.get("did") or "")
+            if not did or w.get("cancelled") or _lecture_ended(w, now_ts) or w.get("dida_task_id"):
+                skipped += 1
+                continue
+            ok, res = self.sync_won_item_to_dida(did, force=False, allow_ended=False)
+            if ok:
+                synced += 1
+            else:
+                failed += 1
+                last_err = res
+        return {
+            "ok": failed == 0 or synced > 0,
+            "synced": synced,
+            "skipped": skipped,
+            "failed": failed,
+            "msg": ("已同步 %d 场未来讲座（跳过 %d 场已同步/已结束）" % (synced, skipped)) + (
+                ("，失败 %d 场: %s" % (failed, last_err)) if failed else ""
+            ),
+        }
+
     def won_verify(self):
         if not self.client.cookie:
             return
@@ -787,6 +910,7 @@ class UserRuntime:
                 won = [dict(w) for w in self.state["engine"].get("won", [])]
             now_ts = time.time()
             changed = False
+            cancelled_items = []
             for w in won:
                 did = str(w.get("did") or "")
                 if not did or w.get("cancelled") or _lecture_ended(w, now_ts):
@@ -799,9 +923,12 @@ class UserRuntime:
                                 e["cancelled"] = True
                                 e["cancelled_at"] = nowstr()
                     changed = True
+                    cancelled_items.append(w)
                     self.log("[won] ⚠️ 官方已无报名记录(疑似手动取消): 《%s》— 已标记, 不会自动重抢" % str(w.get("title"))[:30])
             if changed:
                 self.save_won()
+                for cw in cancelled_items:
+                    threading.Thread(target=self.remove_cancelled_from_dida, args=(cw,), daemon=True).start()
         except Exception as e:
             self.log("[won] 核对异常 %s" % e)
 
@@ -871,6 +998,9 @@ class UserRuntime:
         if ok:
             self.save_won()
             self.push("success", "🎉 报名成功: %s (%s)" % (str(title)[:40], str(did)[:8]))
+            dcfg = self.load_cfg(readonly=True).get("dida365") or {}
+            if dcfg.get("enabled") and dcfg.get("sync_on_win", True) and str(dcfg.get("token") or "").strip():
+                threading.Thread(target=self.sync_won_item_to_dida, args=(did,), daemon=True).start()
         elif reason == "cookie_dead":
             self.record_dead_candidate("抢报接口返回登录失效", source="grab")
         elif hard_retry:
@@ -1974,9 +2104,56 @@ def api_config():
         for k in ("notify_events", "prefix", "webhook", "secret"):
             if k in d:
                 c.setdefault("dingtalk", {})[k] = d[k]
+    dd = data.get("dida365")
+    if isinstance(dd, dict):
+        dc = c.setdefault("dida365", {})
+        if "enabled" in dd:
+            dc["enabled"] = bool(dd["enabled"])
+        if "token" in dd:
+            dc["token"] = str(dd["token"] or "").strip()
+        if "project_name" in dd:
+            new_pname = str(dd["project_name"] or "").strip() or "🎓 同济讲座"
+            if new_pname != str(dc.get("project_name") or "").strip():
+                dc["project_id"] = ""
+            dc["project_name"] = new_pname
+        if "project_id" in dd:
+            dc["project_id"] = str(dd["project_id"] or "").strip()
+        if "sync_on_win" in dd:
+            dc["sync_on_win"] = bool(dd["sync_on_win"])
+        if "delete_on_cancel" in dd:
+            dc["delete_on_cancel"] = bool(dd["delete_on_cancel"])
+        if "remind_before_min" in dd:
+            try:
+                dc["remind_before_min"] = max(0, min(1440, int(dd["remind_before_min"])))
+            except Exception:
+                pass
     u.save_cfg(c)
     u.log("[config] 已更新 grab=%s keepalive=%s" % (json.dumps(c.get("grab"), ensure_ascii=False), c.get("keepalive_sec")))
     return jsonify({"ok": True, "cfg": _public_cfg(c)})
+
+
+@app.route("/api/dida/test", methods=["POST"])
+def api_dida_test():
+    u = flask_g.current_user
+    body = request.get_json(silent=True) or {}
+    cfg = u.load_cfg(readonly=True)
+    dcfg = cfg.get("dida365") or {}
+    tok = str(body.get("token") or dcfg.get("token") or "").strip()
+    ok, msg, projs = dida_mod.list_projects(tok)
+    if not ok:
+        return jsonify({"ok": False, "msg": msg})
+    return jsonify({
+        "ok": True,
+        "msg": "连接成功，共 %d 个清单" % len(projs),
+        "projects": [{"id": p.get("id", ""), "name": p.get("name", "")} for p in projs[:30]],
+    })
+
+
+@app.route("/api/dida/sync", methods=["POST"])
+def api_dida_sync():
+    u = flask_g.current_user
+    res = u.sync_all_upcoming_won_to_dida()
+    return jsonify(res)
 
 
 @app.route("/api/cookie", methods=["POST"])
