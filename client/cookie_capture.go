@@ -54,6 +54,15 @@ func findMitmdump(projDir string) string {
 			filepath.Join(exeDir, "..", "Resources", binName),
 		)
 	}
+	if runtime.GOOS == "windows" {
+		cands = append(cands, filepath.Join(configDir(), "venv", "Scripts", binName))
+	} else {
+		cands = append(cands,
+			filepath.Join(configDir(), "venv", "bin", binName),
+			"/opt/homebrew/bin/mitmdump",
+			"/usr/local/bin/mitmdump",
+		)
+	}
 	if projDir != "" {
 		if runtime.GOOS == "windows" {
 			cands = append(cands,
@@ -76,13 +85,8 @@ func findMitmdump(projDir string) string {
 }
 
 func prepareCapturePaths(projDir string) (workDir, snifferPath, tokenPath, debugLogPath string, err error) {
-	if projDir != "" {
-		cookieDir := filepath.Join(projDir, "cookie-mac-linux")
-		sp := filepath.Join(cookieDir, "token_sniffer.py")
-		if _, statErr := os.Stat(sp); statErr == nil {
-			return cookieDir, sp, filepath.Join(cookieDir, "token.json"), filepath.Join(cookieDir, "sniff_debug.log"), nil
-		}
-	}
+	// Always stage capture scripts & temp files in local configDir() (never inside iCloud-synced Desktop).
+	_ = projDir
 	workDir = filepath.Join(configDir(), "capture")
 	if err = os.MkdirAll(workDir, 0o700); err != nil {
 		return "", "", "", "", err
@@ -160,7 +164,7 @@ func waitPortReady(ctx context.Context, host string, port int, maxWait time.Dura
 		}
 		time.Sleep(80 * time.Millisecond)
 	}
-	return nil
+	return fmt.Errorf("mitmdump 在 %v 内未能监听端口 %d，已中止且未切换系统代理", maxWait, port)
 }
 
 // captureAndUploadCookie starts mitmdump scoped to lecture.tongji.edu.cn, toggles system proxy,
@@ -210,7 +214,7 @@ func captureAndUploadCookie(ctx context.Context, cfg ClientConfig, api *apiClien
 		terminateProcess(cmd, cmdDone)
 	}()
 
-	if err := waitPortReady(ctx, "127.0.0.1", cfg.ProxyPort, 2*time.Second, cmdDone); err != nil {
+	if err := waitPortReady(ctx, "127.0.0.1", cfg.ProxyPort, 10*time.Second, cmdDone); err != nil {
 		return err
 	}
 	if _, certMsg := ensureMitmCert(); certMsg != "" {
