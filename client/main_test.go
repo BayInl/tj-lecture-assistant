@@ -1,8 +1,10 @@
 package main
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -134,5 +136,37 @@ func TestLoginAndFetchToken(t *testing.T) {
 	tok, err := cli.LoginAndFetchToken(ts.URL, "alice", "secret123")
 	if err != nil || tok != "tok-alice-999" {
 		t.Fatalf("expected token tok-alice-999, got tok=%q err=%v", tok, err)
+	}
+}
+
+func TestCapturePortAndSanitizeProxy(t *testing.T) {
+	orig := proxySnapshot{
+		HTTPEnabled:  true,
+		HTTPServer:   "127.0.0.1",
+		HTTPPort:     "8080",
+		HTTPSEnabled: true,
+		HTTPSServer:  "10.0.0.2",
+		HTTPSPort:    "7890",
+	}
+	sanitized := sanitizeOrigProxy(orig, 8080)
+	if sanitized.HTTPEnabled {
+		t.Fatal("expected leftover self HTTP proxy on 8080 to be cleared")
+	}
+	if !sanitized.HTTPSEnabled || sanitized.HTTPSServer != "10.0.0.2" {
+		t.Fatalf("expected non-self HTTPS proxy to be preserved, got %+v", sanitized)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	busyPort := ln.Addr().(*net.TCPAddr).Port
+	picked, err := pickCapturePort(busyPort)
+	if err != nil {
+		t.Fatalf("expected free fallback port, got err=%v", err)
+	}
+	if picked == busyPort || picked <= 0 {
+		t.Fatalf("expected picked port != %d, got %d (port=%s)", busyPort, picked, strconv.Itoa(picked))
 	}
 }

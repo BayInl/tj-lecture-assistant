@@ -14,6 +14,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -149,7 +152,112 @@ func validateTongjiCookie(cookie string) (bool, map[string]any, string) {
 	return false, nil, env.Msg
 }
 
-func waitPortReady(ctx context.Context, host string, port int, maxWait time.Duration, exited <-chan error) error {
+type tailBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.max <= 0 {
+		b.max = 4096
+	}
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > b.max {
+		b.buf = append([]byte(nil), b.buf[len(b.buf)-b.max:]...)
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) LastLine() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	lines := strings.Split(strings.TrimSpace(string(b.buf)), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		s := strings.TrimSpace(lines[i])
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func formatMitmExit(werr error, tb *tailBuffer) string {
+	last := ""
+	if tb != nil {
+		last = tb.LastLine()
+	}
+	if last != "" {
+		return fmt.Sprintf("%v (%s)", werr, last)
+	}
+	return fmt.Sprintf("%v", werr)
+}
+
+func isLoopbackHost(host string) bool {
+	h := strings.TrimSpace(strings.ToLower(host))
+	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+// sanitizeOrigProxy prevents restoring a leftover proxy left behind by an earlier killed capture session.
+func sanitizeOrigProxy(orig proxySnapshot, ports ...int) proxySnapshot {
+	portSet := make(map[string]struct{}, len(ports))
+	for _, p := range ports {
+		if p > 0 {
+			portSet[strconv.Itoa(p)] = struct{}{}
+		}
+	}
+	if _, match := portSet[strings.TrimSpace(orig.HTTPPort)]; match && isLoopbackHost(orig.HTTPServer) {
+		orig.HTTPEnabled = false
+	}
+	if _, match := portSet[strings.TrimSpace(orig.HTTPSPort)]; match && isLoopbackHost(orig.HTTPSServer) {
+		orig.HTTPSEnabled = false
+	}
+	return orig
+}
+
+func tryBindLoopbackPort(port int) bool {
+	if port <= 0 {
+		return false
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+func cleanupStaleSniffers() {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	_ = exec.Command("pkill", "-f", "token_sniffer.py").Run()
+}
+
+func pickCapturePort(preferred int) (int, error) {
+	if tryBindLoopbackPort(preferred) {
+		return preferred, nil
+	}
+	cleanupStaleSniffers()
+	deadline := time.Now().Add(800 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if tryBindLoopbackPort(preferred) {
+			return preferred, nil
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("无法分配抓包监听端口: %w", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port, nil
+}
+
+func waitPortReady(ctx context.Context, host string, port int, maxWait time.Duration, exited <-chan error, logs *tailBuffer) error {
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
@@ -157,7 +265,7 @@ func waitPortReady(ctx context.Context, host string, port int, maxWait time.Dura
 		case <-ctx.Done():
 			return ctx.Err()
 		case werr := <-exited:
-			return fmt.Errorf("mitmdump 启动后退出(端口 %d 可能被占用): %v", port, werr)
+			return fmt.Errorf("mitmdump 启动后退出(端口 %d): %s", port, formatMitmExit(werr, logs))
 		default:
 		}
 		conn, err := net.DialTimeout("tcp", addr, 80*time.Millisecond)
@@ -194,15 +302,27 @@ func captureAndUploadCookie(ctx context.Context, cfg ClientConfig, api *apiClien
 		}
 	}
 
-	progress("正在启动 mitmdump (仅拦截同济高等讲堂域名)…")
+	listenPort, err := pickCapturePort(cfg.ProxyPort)
+	if err != nil {
+		return err
+	}
+	if listenPort != cfg.ProxyPort {
+		progress(fmt.Sprintf("端口 %d 被其他程序占用，自动改用端口 %d 启动抓包…", cfg.ProxyPort, listenPort))
+	} else {
+		progress("正在启动 mitmdump (仅拦截同济高等讲堂域名)…")
+	}
+
+	mitmOut := &tailBuffer{max: 4096}
 	cmd := exec.CommandContext(ctx, mitmBin,
 		"-s", snifferPath,
 		"--listen-host", "127.0.0.1",
-		"--listen-port", fmt.Sprintf("%d", cfg.ProxyPort),
+		"--listen-port", strconv.Itoa(listenPort),
 		"--allow-hosts", `^lecture\.tongji\.edu\.cn(:443)?$`,
 		"--set", "ssl_insecure=true",
 	)
 	cmd.Dir = cookieDir
+	cmd.Stdout = mitmOut
+	cmd.Stderr = mitmOut
 	configureBackgroundCmd(cmd)
 	cmd.Env = append(os.Environ(),
 		"TJ_SNIFFER_OUT="+tokenPath,
@@ -217,15 +337,15 @@ func captureAndUploadCookie(ctx context.Context, cfg ClientConfig, api *apiClien
 		terminateProcess(cmd, cmdDone)
 	}()
 
-	if err := waitPortReady(ctx, "127.0.0.1", cfg.ProxyPort, 10*time.Second, cmdDone); err != nil {
+	if err := waitPortReady(ctx, "127.0.0.1", listenPort, 10*time.Second, cmdDone, mitmOut); err != nil {
 		return err
 	}
 	if _, certMsg := ensureMitmCert(); certMsg != "" {
 		progress(certMsg)
 	}
 
-	origProxy := getSystemProxy(cfg.NetworkService)
-	if err := setSystemProxy(cfg.NetworkService, "127.0.0.1", cfg.ProxyPort); err != nil {
+	origProxy := sanitizeOrigProxy(getSystemProxy(cfg.NetworkService), cfg.ProxyPort, listenPort)
+	if err := setSystemProxy(cfg.NetworkService, "127.0.0.1", listenPort); err != nil {
 		return fmt.Errorf("设置系统代理失败: %w", err)
 	}
 	defer restoreSystemProxy(cfg.NetworkService, origProxy)
@@ -239,9 +359,9 @@ func captureAndUploadCookie(ctx context.Context, cfg ClientConfig, api *apiClien
 		}
 	} else {
 		if runtime.GOOS == "windows" {
-			progress(fmt.Sprintf("代理已切至 127.0.0.1:%d，请在电脑微信打开「同济高等讲堂」（无响应请重开微信）…", cfg.ProxyPort))
+			progress(fmt.Sprintf("代理已切至 127.0.0.1:%d，请在电脑微信打开「同济高等讲堂」（无响应请重开微信）…", listenPort))
 		} else {
-			progress(fmt.Sprintf("代理已切至 127.0.0.1:%d，请在电脑微信里打开/刷新「同济高等讲堂」…", cfg.ProxyPort))
+			progress(fmt.Sprintf("代理已切至 127.0.0.1:%d，请在电脑微信里打开/刷新「同济高等讲堂」…", listenPort))
 		}
 	}
 
@@ -257,7 +377,7 @@ func captureAndUploadCookie(ctx context.Context, cfg ClientConfig, api *apiClien
 		case <-ctx.Done():
 			return ctx.Err()
 		case werr := <-cmdDone:
-			return fmt.Errorf("mitmdump 意外退出: %v", werr)
+			return fmt.Errorf("mitmdump 意外退出: %s", formatMitmExit(werr, mitmOut))
 		case <-ticker.C:
 		}
 

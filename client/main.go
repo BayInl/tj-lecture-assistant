@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -36,7 +37,9 @@ type lectureApp struct {
 	status          ServerStatus
 	actionBusy      bool
 	actionMsg       string
+	capMu           sync.Mutex
 	captureCancel   context.CancelFunc
+	captureDone     chan struct{}
 	axGranted       bool
 	srGranted       bool
 	recordingPt     bool
@@ -428,6 +431,7 @@ func eventTitle(ev string) string {
 
 func (a *lectureApp) runCapture(automate bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	done := make(chan struct{})
 	alreadyBusy := false
 	a.applyUI(true, func() {
 		if a.actionBusy {
@@ -435,25 +439,40 @@ func (a *lectureApp) runCapture(automate bool) {
 			return
 		}
 		a.actionBusy = true
+		a.capMu.Lock()
 		a.captureCancel = cancel
+		a.captureDone = done
+		a.capMu.Unlock()
 		a.actionMsg = "准备抓包…"
 		a.refreshTrayTitle()
 	})
 	if alreadyBusy {
 		cancel()
+		close(done)
 		return
 	}
 
-	defer cancel()
-	err := captureAndUploadCookie(ctx, a.cfg, a.api, automate, func(msg string) {
-		a.applyUI(true, func() {
-			a.actionMsg = msg
+	var err error
+	func() {
+		defer func() {
+			cancel()
+			a.capMu.Lock()
+			if a.captureDone == done {
+				a.captureDone = nil
+				a.captureCancel = nil
+			}
+			a.capMu.Unlock()
+			close(done)
+		}()
+		err = captureAndUploadCookie(ctx, a.cfg, a.api, automate, func(msg string) {
+			a.applyUI(true, func() {
+				a.actionMsg = msg
+			})
 		})
-	})
+	}()
 
 	a.applyUI(true, func() {
 		a.actionBusy = false
-		a.captureCancel = nil
 		a.autoRegrabInFlight = false
 		if err != nil {
 			a.actionMsg = "❌ " + err.Error()
@@ -469,6 +488,22 @@ func (a *lectureApp) runCapture(automate bool) {
 		go sendNotification("cookie-update-fail", "Cookie 更新未完成", err.Error(), func() {
 			mygo.RunOnMain(a.show)
 		})
+	}
+}
+
+func (a *lectureApp) stopCaptureAndWait(timeout time.Duration) {
+	a.capMu.Lock()
+	cancel := a.captureCancel
+	done := a.captureDone
+	a.capMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(timeout):
+		}
 	}
 }
 
@@ -1162,6 +1197,7 @@ func (a *lectureApp) ready() {
 	})
 
 	mygo.App.OnWillQuit(func(*mygo.QuitEvent) {
+		a.stopCaptureAndWait(1500 * time.Millisecond)
 		localSrv.stop()
 		a.tray.Destroy()
 	})
